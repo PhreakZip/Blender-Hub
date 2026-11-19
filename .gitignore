@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+*.blend
+*.blend1
+tests/results/
+*.log
+*.tmp
+*.tmp-blender-hub
+.venv/
+.vscode/
+.idea/
+.claude/
+Thumbs.db
+*.bak-blender-hub-*
