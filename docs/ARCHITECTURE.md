@@ -42,7 +42,7 @@ MCP client (Claude Desktop/Code, Cursor...) --stdio--> hub.py (MCP server, state
 - A returning agent with an old token gets `was RECYCLED at ... archived in ...`, and `hub_restore_archive` brings the work back with its keys.
 
 ## Window mode
-- `gui=true` starts Blender with a window, so the user can watch and orbit while agents work.
+- Default for the MCP tools (`gui` omitted = window, configurable with `BLENDER_HUB_GUI_DEFAULT`): each session gets its own Blender window, so the user can watch and orbit while agents work. The Python API defaults to background. Windows never idle-exit and are never recycled, so they have their own cap (`BLENDER_HUB_MAX_WINDOWS`, 4); the mode is stored in `autosave/<name>/meta.json` so restart, kill and restore keep it.
 - The UI is protected in four ways:
   - the user's Edit/Sculpt mode is exited before agent commands;
   - an autosave runs ~5 s after any change, including manual edits, but not during playback or selection-only changes;
@@ -59,4 +59,5 @@ MCP client (Claude Desktop/Code, Cursor...) --stdio--> hub.py (MCP server, state
 - Any session can restore an archive or, with an exclusive lease, reissue the key of an agent with no live token — broad on purpose (recover work of an agent that vanished), and always recorded. Lease labels are informative, not authentication.
 - Kill-by-time deadlines: `exec` uses its own `timeout`, turntable 1800 s, every other command a fixed 600 s.
 - A single autosave copy taking more than 180 s could lose the name reservation.
+- The window cap is checked before a window boots but not atomically with it: two sessions opening windows at the same instant can exceed it by one.
 - Windows only.

@@ -14,6 +14,8 @@ Options:
     --blender PATH   Blender executable (default: auto-detect, see blender_paths.py)
     --config PATH    Claude Desktop config file (default: auto-detect; required if several exist)
     --name NAME      MCP server name (default: blender-hub)
+    --background     agents work in background Blenders by default (no windows); use on machines
+                     without a desktop/OpenGL (VMs, RDP, remote). Default: one live window per session
     --yes            do not ask before writing a config file
 
 Every config file is backed up next to itself (<file>.bak-blender-hub-<timestamp>) before writing.
@@ -82,8 +84,11 @@ def check_blender(path):
 
 
 # ---------------------------------------------------------------- entry
-def server_entry(blender):
-    return {"command": sys.executable, "args": [HUB], "env": {"BLENDER_EXE": blender}}
+def server_entry(blender, background=False):
+    env = {"BLENDER_EXE": blender}
+    if background:
+        env["BLENDER_HUB_GUI_DEFAULT"] = "0"
+    return {"command": sys.executable, "args": [HUB], "env": env}
 
 
 def backup(path):
@@ -180,8 +185,10 @@ def do_claude_code(args, entry):
     if args.uninstall:
         cmd = ["claude", "mcp", "remove", "--scope", "user", args.name]
     else:
-        cmd = ["claude", "mcp", "add", "--scope", "user", args.name,
-               "-e", f"BLENDER_EXE={entry['env']['BLENDER_EXE']}", "--", entry["command"], HUB]
+        cmd = ["claude", "mcp", "add", "--scope", "user", args.name]
+        for k, v in entry["env"].items():  # every env var (BLENDER_EXE, and BLENDER_HUB_GUI_DEFAULT with --background)
+            cmd += ["-e", f"{k}={v}"]
+        cmd += ["--", entry["command"], HUB]
     if not claude:
         say("`claude` CLI not on PATH. Run this yourself:\n  " + subprocess.list2cmdline(cmd), "warn")
         return
@@ -196,7 +203,7 @@ def do_claude_code(args, entry):
 
 
 # ---------------------------------------------------------------- smoke test
-def smoke_test(blender):
+def smoke_test(blender, background=False):
     """Starts one background worker in a throwaway state dir, runs the main tools, stops it."""
     state = tempfile.mkdtemp(prefix="blender-hub-install-test-")
     os.environ.update(BLENDER_EXE=blender, BLENDER_HUB_STATE=state, BLENDER_HUB_PORT_BASE="9961")
@@ -220,6 +227,21 @@ def smoke_test(blender):
         assert tt.get("ok") and os.path.exists(tt["result"]["sheet"]), tt
         h.stop_worker(w, token=tok)
         say(f"smoke test passed in {time.time() - t0:.1f}s (worker start, exec, measure, turntable, stop)", "ok")
+        if not background:  # the MCP default opens a window: check that windows work on this machine
+            t1 = time.time()
+            try:
+                h.start_worker("install-test-window", gui=True, wait=60)
+                h.stop_worker("install-test-window")
+                say(f"window test passed in {time.time() - t1:.1f}s (a Blender window opened and closed)", "ok")
+            except Exception as e:
+                with __import__("contextlib").suppress(Exception):
+                    h.kill_all_unsafe()
+                log = os.path.join(tempfile.gettempdir(), "blender-hub-install-window-test.log")
+                with __import__("contextlib").suppress(OSError):
+                    shutil.copyfile(os.path.join(state, "install-test-window.log"), log)
+                say(f"a Blender WINDOW could not be opened here ({e!s:.200}). Agents open a window by default; "
+                    "re-run with --background (install.ps1 -Background) so they work without windows. "
+                    f"Window log: {log}", "warn")
         os.environ.pop("BLENDER_HUB_STATE", None)
         os.environ.pop("BLENDER_HUB_PORT_BASE", None)
     except Exception as e:
@@ -242,6 +264,7 @@ def main():
     ap.add_argument("--test", action="store_true")
     ap.add_argument("--uninstall", action="store_true")
     ap.add_argument("--yes", action="store_true")
+    ap.add_argument("--background", action="store_true")
     args = ap.parse_args()
 
     check_platform()
@@ -250,12 +273,12 @@ def main():
         blender = None
     else:
         blender = check_blender(args.blender)
-        entry = server_entry(blender)
+        entry = server_entry(blender, args.background)
     if args.check:
         say("check only: nothing was changed", "ok")
         return
     if args.test and not args.uninstall:  # test first: register only a hub that works
-        smoke_test(blender)
+        smoke_test(blender, args.background)
     did = False
     if args.claude_desktop:
         do_claude_desktop(args, entry)

@@ -24,7 +24,7 @@ import subprocess
 import threading
 import contextlib
 
-VERSION = "0.6.3"
+VERSION = "0.7.0"
 HERE = os.path.dirname(os.path.abspath(__file__))
 WORKER = os.path.join(HERE, "worker.py")
 sys.path.insert(0, HERE)
@@ -40,6 +40,50 @@ MAX_WORKERS = int(os.environ.get("BLENDER_HUB_MAX_WORKERS", "10"))
 MIN_FREE_MB = int(os.environ.get("BLENDER_HUB_MIN_FREE_MB", "1500"))
 IDLE_S = os.environ.get("BLENDER_HUB_IDLE", "1800")
 AUTOSAVE_S = os.environ.get("BLENDER_HUB_AUTOSAVE", "300")
+# MCP tools open a window by default (the user watches live; one window per session).
+# The Python API keeps gui=False by default. Set BLENDER_HUB_GUI_DEFAULT=0 for background by default.
+GUI_DEFAULT = os.environ.get("BLENDER_HUB_GUI_DEFAULT", "1").strip().lower() not in ("0", "false", "no", "off", "")
+
+
+MAX_WINDOWS = int(os.environ.get("BLENDER_HUB_MAX_WINDOWS", "4"))  # windows never idle-exit: separate, lower cap
+_FALSE = ("0", "false", "no", "off", "")
+
+
+def _parse_bool(v):
+    if isinstance(v, str):  # some clients send booleans as strings: "false" must stay false
+        return v.strip().lower() not in _FALSE
+    return bool(v)
+
+
+def _gui_arg(args):
+    """gui from the tool call; when omitted, the GUI_DEFAULT (live window unless configured otherwise)."""
+    v = args.get("gui")
+    return GUI_DEFAULT if v is None else _parse_bool(v)
+
+
+def _meta_path(folder):
+    return os.path.join(folder, "meta.json")
+
+
+def _read_meta(folder):
+    try:
+        with open(_meta_path(folder), encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def _write_meta(name, **data):
+    """Saved next to the autosaves (and moved with them into archives): restart/restore keep the window mode."""
+    folder = os.path.join(STATE_DIR, "autosave", name)
+    with contextlib.suppress(OSError):
+        os.makedirs(folder, exist_ok=True)
+        cur = _read_meta(folder)
+        cur.update(data)
+        tmp = _meta_path(folder) + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(cur, f)
+        os.replace(tmp, _meta_path(folder))
 NAME_RE = re.compile(r"[A-Za-z0-9_\-]{1,32}")
 
 
@@ -404,6 +448,7 @@ class Hub:
                     r = c.call({"cmd": "ping", "secret": secret})
                     c.close()
                     if r.get("ok") and r["result"].get("name") == name:
+                        _write_meta(name, gui=bool(gui))
                         old = self._conns.pop(name, None)  # connection to the previous (dead) process
                         if old:
                             old.close()
@@ -421,7 +466,9 @@ class Hub:
             if code is None:
                 p.kill()
                 raise TimeoutError(f"worker {name} did not answer in {wait}s; see {log_path}")
-            raise RuntimeError(f"Blender exited (code {code}); see {log_path}")
+            hint = (" | a Blender WINDOW could not be opened here (no desktop session / OpenGL?): pass gui=false, "
+                    "or set BLENDER_HUB_GUI_DEFAULT=0 in the MCP server env" if gui else "")
+            raise RuntimeError(f"Blender exited (code {code}); see {log_path}{hint}")
         raise RuntimeError("5 ports failed to bind")
 
     def stop_worker(self, name, token=None):
@@ -466,8 +513,11 @@ class Hub:
         with _locked():
             _write_reg({})
 
-    def restart_worker(self, name):
-        """Dead worker (crash/idle): boots it again from its autosave."""
+    def restart_worker(self, name, gui=None, default_gui=False, _from_kill=False):
+        """Dead worker (crash/idle/closed window): boots it again from its autosave.
+
+        gui=None keeps the mode it had (registry entry, else meta.json next to its autosaves, else default_gui).
+        """
         w = self.workers().get(name)
         if w and _is_our_worker(w):
             raise RuntimeError(f"{name} is alive")
@@ -475,8 +525,14 @@ class Hub:
         auto = files[-1] if files else None
         prev = (w or {}).get("recycled_from")
         self.workers(clean=True)
+        if gui is None:
+            gui = (w or {}).get("gui")
+        if gui is None:
+            gui = _read_meta(os.path.join(STATE_DIR, "autosave", name)).get("gui", default_gui)
+        if gui and not _from_kill:
+            self.check_window_cap()
         return dict(self.start_worker(name, blend=auto, limit=MAX_WORKERS, check_ram=True, keep_keys=bool(auto),
-                                      recycled_from=prev, gui=bool((w or {}).get("gui"))),
+                                      recycled_from=prev, gui=bool(gui)),
                     from_autosave=auto, autosaves=len(files))
 
     def kill_worker(self, name, token=None, grace=None):
@@ -516,7 +572,40 @@ class Hub:
             if reg.get(name, {}).get("pid") == w["pid"]:
                 reg.pop(name)
             _write_reg(reg)
-        return dict(self.restart_worker(name), killed=True, was_busy=st.get("busy"), busy_s=busy_s)
+        return dict(self.restart_worker(name, gui=bool(w.get("gui")), _from_kill=True), killed=True, was_busy=st.get("busy"), busy_s=busy_s)
+
+    def windows(self):
+        """Open windows: name, leases, idle minutes (for actionable errors)."""
+        out = []
+        for n, w in self.workers(clean=True).items():
+            if not w.get("gui"):
+                continue
+            try:
+                st = self.status(n)
+                out.append({"name": n, "leases": len(st.get("participants") or []),
+                            "idle_min": round((st.get("idle_s") or 0) / 60, 1)})
+            except Exception:
+                out.append({"name": n, "leases": None, "idle_min": None})
+        return out
+
+    def _windows_hint(self):
+        wins = self.windows()
+        free = [w for w in wins if not w["leases"]]
+        if not free:
+            return ""
+        return (" | open windows with no lease: " + ", ".join(f"{w['name']} (idle {w['idle_min']} min)" for w in free)
+                + ": ask the user to close one (hub_stop_worker name=...), keep working in one with hub_lease(worker=name), "
+                  "or use gui=false")
+
+    def check_window_cap(self):
+        wins = self.windows()
+        if len(wins) >= MAX_WINDOWS:
+            raise RuntimeError(f"window limit of {MAX_WINDOWS} reached (BLENDER_HUB_MAX_WINDOWS): "
+                               + ", ".join(f"{w['name']} (leases {w['leases']}, idle {w['idle_min']} min)" for w in wins)
+                               + " | ask the user to close a window they no longer watch (hub_stop_worker name=...), "
+                                 "keep working in an existing one with hub_lease(worker=name), "
+                                 "or pass gui=false to work in the background"
+                               + " (the cap can be exceeded by one when two sessions open windows at the same instant)")
 
     def acquire(self, mode="exclusive", label=None, blend=None, ttl=900, gui=False):
         """Pool: takes a free worker (no lease) or boots a new one, and leases it."""
@@ -538,22 +627,25 @@ class Hub:
             r = self.call(name, "lease", mode=mode, label=label, ttl=ttl)
             if r.get("ok"):
                 return dict(r["result"], reused=True)
+        if gui:  # before the pool-full branch: recycling may boot the replacement as a window
+            self.check_window_cap()
         if len(reg) >= MAX_WORKERS:
-            rec = self._recycle_one(reg, blend)
+            rec = self._recycle_one(reg, blend, gui=gui)
             if rec:
                 r = self.call(rec["name"], "lease", mode=mode, label=label, ttl=ttl)
                 if r.get("ok"):
                     return dict(r["result"], reused=False, recycled=rec)
             why = getattr(self, "_last_recycle_error", None)
             raise RuntimeError(f"worker limit of {MAX_WORKERS} reached and none is free; free one (hub_release/hub_stop_worker)"
-                               + (f" [did not recycle, to avoid losing work: {why}]" if why else ""))
+                               + (f" [did not recycle, to avoid losing work: {why}]" if why else "") + self._windows_hint())
         if free_mb() < MIN_FREE_MB:
             raise MemoryError(f"free RAM {free_mb()} MB < {MIN_FREE_MB} MB: not starting another Blender")
         for i in range(MAX_WORKERS * 2):
             name = f"w{i}"
             reg = self.workers()
             if len(reg) >= MAX_WORKERS:
-                raise RuntimeError(f"worker limit of {MAX_WORKERS} reached; free one (hub_release/hub_stop_worker)")
+                raise RuntimeError(f"worker limit of {MAX_WORKERS} reached; free one (hub_release/hub_stop_worker)"
+                                   + self._windows_hint())
             if name not in reg:
                 try:
                     self.start_worker(name, blend=blend, limit=MAX_WORKERS, gui=gui)
@@ -567,7 +659,7 @@ class Hub:
                 return dict(r["result"], reused=False)
         raise RuntimeError("no free name")
 
-    def _recycle_one(self, reg, blend=None):
+    def _recycle_one(self, reg, blend=None, gui=False):
         """Limit reached: the unleased worker idle for the longest is stopped (autosave) and booted clean.
 
         The work it held is archived in autosave/<name>-<date>/ (keys included).
@@ -608,7 +700,7 @@ class Hub:
                    "file": before.get("file"), "idle_s": before.get("idle_s")}
             _add_recycled(rec)  # whoever comes back is told and finds the archive
             try:
-                self.start_worker(name, blend=blend, limit=MAX_WORKERS)
+                self.start_worker(name, blend=blend, limit=MAX_WORKERS, gui=gui)
             except RuntimeError as e:
                 if "was just created" in str(e):
                     continue  # another process took the name between the stop and the start
@@ -626,7 +718,7 @@ class Hub:
         recs = _read_recycled()
         return [r for r in recs if name is None or r["name"] == name]
 
-    def restore_archive(self, archive, name=None):
+    def restore_archive(self, archive, name=None, gui=None, default_gui=False):
         """Boots a new worker with the newest autosave of a recycle archive and its keys.
 
         Agents resume as usual: hub_lease (shared) + agent_key.
@@ -652,8 +744,12 @@ class Hub:
             raise RuntimeError(f"this archive was already restored as {name}: use hub_restart_worker {name} "
                                "(keeps the newer autosave and keys)")
         # restore over a name already in use: start_worker archives what was there and only then copies the keys
+        if gui is None:  # the mode the archived worker had, else the default
+            gui = _read_meta(archive).get("gui", default_gui)
+        if gui:
+            self.check_window_cap()
         w = self.start_worker(name, blend=files[-1], limit=MAX_WORKERS, check_ram=True, keep_keys=False,
-                              keys_from=keys_src)
+                              keys_from=keys_src, gui=bool(gui))
         for r in _read_recycled():
             if os.path.normcase(r["archived"]) == os.path.normcase(archive):
                 r["restored_as"] = name
@@ -709,30 +805,32 @@ S = {"type": "string"}
 TOKEN = {"type": "string", "description": "lease token returned by hub_acquire/hub_lease"}
 KEY = {"type": "string", "description": "agent_key returned on the agent's first use; only required to resume the agent after its lease expired"}
 TOOLS = [
-    ("hub_acquire", "Get a free Blender worker (background, or with a window when gui=true; boots a new one if needed) and lease it. Returns worker + token: keep the token, every other tool needs it. mode=exclusive (only you) or shared (several agents, each in its own collection).",
+    ("hub_acquire", "Get a free Blender worker (boots a new one if needed) and lease it. By default it opens a Blender WINDOW so the user watches you work live (one window per session); pass gui=false for background/parallel batch work. Returns worker + token: keep the token, every other tool needs it. mode=exclusive (only you, default) or shared (several agents, each in its own collection). When done: hub_release, then ask the user whether to close the window (hub_stop_worker); windows never close on their own and are capped (BLENDER_HUB_MAX_WINDOWS).",
      {"mode": {"type": "string", "enum": ["exclusive", "shared"]}, "label": S, "blend": S, "ttl": {"type": "number"},
-      "gui": {"type": "boolean", "description": "true = windowed Blender, so the user can watch live"}}, []),
+      "gui": {"type": "boolean", "description": "default true (server setting BLENDER_HUB_GUI_DEFAULT): windowed Blender the user can watch live; false = background"}}, []),
     ("hub_lease", "Join a specific worker (e.g. another agent's shared one). Returns a token. Default mode=exclusive; pass mode=\"shared\" to join a worker others are using.",
      {"worker": S, "mode": {"type": "string", "enum": ["exclusive", "shared"]}, "label": S, "ttl": {"type": "number"}}, ["worker"]),
     ("hub_renew", "Renew the lease (every command already renews it).", {"worker": S, "token": TOKEN}, ["worker", "token"]),
     ("hub_release", "Release only your own lease.", {"worker": S, "token": TOKEN}, ["worker", "token"]),
     ("hub_list_workers", "List live workers: leases, agents, what each is busy with, RAM, autosave. Does not wait for long-running work.", {}, []),
-    ("hub_start_worker", "Boot a worker with a chosen name and .blend (hub_acquire already does this on its own). gui=true opens it with a window.",
-     {"name": S, "blend": S, "gui": {"type": "boolean"}}, ["name"]),
+    ("hub_start_worker", "Boot a worker with a chosen name and .blend (hub_acquire already does this on its own). Opens with a window by default; gui=false for background.",
+     {"name": S, "blend": S, "gui": {"type": "boolean", "description": "default true (BLENDER_HUB_GUI_DEFAULT)"}}, ["name"]),
     ("hub_view", "Windowed worker: frame the viewport on the target (collection/objects) for whoever is watching. Optional shading (VERTEX, MATERIAL...).",
      {"worker": S, "token": TOKEN, "collection": S, "objects": {"type": "array", "items": S}, "shading": S}, ["worker", "token"]),
     ("hub_screenshot", "Windowed worker: screenshot of the Blender window (what the user is seeing). Returns the image.",
      {"worker": S, "token": TOKEN}, ["worker", "token"]),
     ("hub_stop_worker", "Stop the worker. Refused if another session holds a lease.", {"name": S, "token": TOKEN}, ["name"]),
-    ("hub_restart_worker", "Boot again a worker that died, from its newest autosave.", {"name": S}, ["name"]),
+    ("hub_restart_worker", "Boot again a worker that died or whose window was closed, from its newest autosave. Keeps its window mode unless gui is given.",
+     {"name": S, "gui": {"type": "boolean"}}, ["name"]),
     ("hub_agent_key", "Lost your agent_key? Request a new one with a token that is still using the agent (the old key stops working). "
                       "Without such a token, an exclusive lease reissues the key when it uses the agent.",
      {"worker": S, "token": TOKEN, "agent": S}, ["worker", "token", "agent"]),
     ("hub_list_archives", "Work archived when the pool recycled a worker (name, time, agents, folder).",
      {"name": S}, []),
     ("hub_restore_archive", "Boot a new worker with the archived work of a recycle (newest autosave + keys). "
-                            "Then: hub_lease(worker, mode=\"shared\") and pass your agent_key on your next hub_exec.",
-     {"archive": S, "name": S}, ["archive"]),
+                            "Then: hub_lease(worker, mode=\"shared\") and pass your agent_key on your next hub_exec. "
+                            "Keeps the archived worker's window mode unless gui is given.",
+     {"archive": S, "name": S, "gui": {"type": "boolean"}}, ["archive"]),
     ("hub_kill_worker", "Hung worker: kill it and boot from autosave. Only if you hold the only live lease, or the running job is past its own timeout by more than the grace period (BLENDER_HUB_KILL_GRACE, default 60 s).",
      {"name": S, "token": TOKEN}, ["name"]),
     ("hub_exec", "Run bpy Python as `agent`. New objects go into Agent_<agent> (use link(ob) for bpy.data.objects.new). Set `result` to return data. Time limit: timeout (s, default 120). Warns if you touched another agent's data.",
@@ -759,17 +857,22 @@ def _tool_call(hub, name, args):
     """Returns (data, png_image_or_None); raises on error."""
     if name == "hub_acquire":
         return hub.acquire(args.get("mode", "exclusive"), args.get("label"), args.get("blend"), args.get("ttl", 900),
-                           gui=bool(args.get("gui"))), None
+                           gui=_gui_arg(args)), None
     if name == "hub_start_worker":
-        return hub.start_worker(args["name"], args.get("blend"), limit=MAX_WORKERS, check_ram=True, gui=bool(args.get("gui"))), None
+        g = _gui_arg(args)
+        if g:
+            hub.check_window_cap()
+        return hub.start_worker(args["name"], args.get("blend"), limit=MAX_WORKERS, check_ram=True, gui=g), None
     if name == "hub_stop_worker":
         return hub.stop_worker(args["name"], args.get("token")), None
     if name == "hub_restart_worker":
-        return hub.restart_worker(args["name"]), None
+        g = _gui_arg(args) if args.get("gui") is not None else None
+        return hub.restart_worker(args["name"], gui=g, default_gui=GUI_DEFAULT), None
     if name == "hub_list_archives":
         return hub.recycled(args.get("name")), None
     if name == "hub_restore_archive":
-        return hub.restore_archive(args["archive"], args.get("name")), None
+        g = _gui_arg(args) if args.get("gui") is not None else None
+        return hub.restore_archive(args["archive"], args.get("name"), gui=g, default_gui=GUI_DEFAULT), None
     if name == "hub_kill_worker":
         return hub.kill_worker(args["name"], args.get("token")), None
     if name == "hub_list_workers":
@@ -778,9 +881,9 @@ def _tool_call(hub, name, args):
             try:
                 out[n] = hub.status(n)
                 st = out[n]
-                if st.get("gui") and not st.get("participants") and (st.get("idle_s") or 0) > 1800:
-                    st["note"] = (f"window open and unused for {round(st['idle_s'] / 60)} min: it takes a slot of the limit "
-                                  "and recycling never closes windows; close it if nobody is watching")
+                if st.get("gui") and not st.get("participants"):
+                    st["note"] = (f"released window (no lease, idle {round((st.get('idle_s') or 0) / 60)} min): it takes a slot of the limit "
+                                  "and recycling never closes windows; ask the user before closing it (hub_stop_worker)")
             except Exception as e:
                 out[n] = {"error": f"no answer: {e}"}
         return out, None
@@ -831,8 +934,9 @@ def serve_mcp():
                 res = {"protocolVersion": asked if asked in SUPPORTED_PROTOCOLS else SUPPORTED_PROTOCOLS[0],
                        "capabilities": {"tools": {}},
                        "serverInfo": {"name": "blender-hub", "version": VERSION},
-                       "instructions": "Background Blender workers shared by multiple agents. Start with hub_acquire and keep the token; "
-                                       "always use the same `agent` name and keep the agent_key returned on its first use (resuming after the lease expires requires it). hub_turntable returns the turntable contact sheet; hub_measure solves fitting/contact."}
+                       "instructions": "Blender workers for multiple agents. Start with hub_acquire (opens a Blender window the user watches live by default; gui=false for background) and keep the token; "
+                                       "always use the same `agent` name and keep the agent_key returned on its first use (resuming after the lease expires requires it). hub_turntable returns the turntable contact sheet; hub_measure solves fitting/contact. "
+                                       "When your task is done: hub_release, and ask the user before closing the window (hub_stop_worker)."}
             elif method == "tools/list":
                 res = {"tools": [{"name": n, "description": d,
                                   "inputSchema": {"type": "object", "properties": p, "required": r}}

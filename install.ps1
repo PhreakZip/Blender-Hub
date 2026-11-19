@@ -17,6 +17,7 @@ param(
   [switch]$Test,
   [switch]$Uninstall,
   [switch]$Yes,
+  [switch]$Background,
   [string]$Blender,
   [string]$Config,
   [string]$Name = "blender-hub"
@@ -61,6 +62,7 @@ if ($Check)         { $a += "--check" }
 if ($Test)          { $a += "--test" }
 if ($Uninstall)     { $a += "--uninstall" }
 if ($Yes)           { $a += "--yes" }
+if ($Background)    { $a += "--background" }
 if ($Blender)       { $a += @("--blender", $Blender) }
 if ($Config)        { $a += @("--config", $Config) }
 $a += @("--name", $Name)

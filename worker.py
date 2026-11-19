@@ -52,7 +52,7 @@ try:
 except Exception:
     np = None
 
-VERSION = "0.6.3"
+VERSION = "0.7.0"
 LEASE_TTL_DEFAULT = 900.0
 LEASE_TTL_MAX = 3600.0
 NET_CMDS = {"ping", "status", "check_token"}   # answered outside the queue, without bpy

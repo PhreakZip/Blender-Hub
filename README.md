@@ -1,6 +1,6 @@
 # Blender Hub
 
-**An MCP server that lets many AI agents work in Blender at the same time** — each in its own background Blender, or several agents sharing one scene, each in its own collection. Optional **window mode** lets you watch the agents build live.
+**An MCP server that lets many AI agents work in Blender at the same time** — each in its own Blender, or several agents sharing one scene, each in its own collection. **By default every session opens its own Blender window**, so you watch the agent build live; background (headless) workers are one flag away for batch work.
 
 Built for Claude (Desktop / Code) and any MCP client. Windows only. No dependencies beyond Python and Blender.
 
@@ -12,7 +12,7 @@ Built for Claude (Desktop / Code) and any MCP client. Windows only. No dependenc
 | Review renders | One viewport capture per call | `hub_turntable`: 12 views + one contact sheet in ~1 s |
 | Fitting parts together | Guess coordinates | `hub_measure`: distance, intersection, penetration and the exact move to make them touch |
 | Crash / forgotten agent | Work lost | Rotating autosaves, archives, `hub_restart_worker`, `hub_restore_archive` |
-| Watch live | Yes (one window) | Yes, `gui=true` windows, with `hub_view` / `hub_screenshot` |
+| Watch live | Yes (one window) | Yes, by default: one window per session, with `hub_view` / `hub_screenshot` |
 
 ---
 
@@ -33,7 +33,8 @@ Built for Claude (Desktop / Code) and any MCP client. Windows only. No dependenc
 - **Windows 10/11** (the hub uses Windows file locks and process APIs).
 - **Python 3.10+** on PATH (`py -3` or `python`). No pip packages.
 - **Blender 4.2+** (tested on 5.3). Auto-detected from Program Files, Steam, PATH or the `.blend` file association; or set `BLENDER_EXE`.
-- RAM: about **210 MB per idle worker** (10 workers ≈ 2.1 GB). The hub refuses to start a worker when free RAM is below 1.5 GB.
+- RAM: about **210 MB per idle background worker** and about **700 MB per window** (plus some GPU memory). The hub refuses to start a worker when free RAM is below 1.5 GB, and caps open windows at 4 (`BLENDER_HUB_MAX_WINDOWS`).
+- A desktop session that can open a Blender window (agents work in a visible window by default). On VMs/RDP/remote machines without OpenGL, install with `-Background`.
 
 ## Install (humans)
 ```powershell
@@ -48,6 +49,7 @@ Other clients:
 powershell -ExecutionPolicy Bypass -File install.ps1 -ClaudeCode      # claude mcp add (user scope)
 powershell -ExecutionPolicy Bypass -File install.ps1 -Cursor          # ~/.cursor/mcp.json
 powershell -ExecutionPolicy Bypass -File install.ps1 -Print           # just print the JSON entry
+powershell -ExecutionPolicy Bypass -File install.ps1 -ClaudeDesktop -Background   # no windows by default (VM/RDP)
 ```
 Manual entry (any MCP client that uses `mcpServers`):
 ```json
@@ -56,11 +58,16 @@ Manual entry (any MCP client that uses `mcpServers`):
     "blender-hub": {
       "command": "C:\\Path\\To\\python.exe",
       "args": ["C:\\Path\\To\\Blender-Hub\\hub.py"],
-      "env": { "BLENDER_EXE": "C:\\Program Files\\Blender Foundation\\Blender 5.3\\blender.exe" }
+      "env": {
+        "BLENDER_EXE": "C:\\Program Files\\Blender Foundation\\Blender 5.3\\blender.exe",
+        "BLENDER_HUB_GUI_DEFAULT": "1"
+      }
     }
   }
 }
 ```
+`BLENDER_HUB_GUI_DEFAULT` is optional (`1` = a live window per session, the default; `0` = background, for machines without a desktop/OpenGL).
+
 Uninstall: `powershell -ExecutionPolicy Bypass -File install.ps1 -ClaudeDesktop -Uninstall` (or `-ClaudeCode` / `-Cursor`; add `-Config "<path>"` if several Claude Desktop configs exist). Every config file is backed up before it is written (`<file>.bak-blender-hub-<timestamp>`). Keep the cloned folder where it is: the config points to it.
 
 ---
@@ -85,7 +92,8 @@ Follow these steps exactly. Stop and tell the user if a step fails; do not impro
    powershell -ExecutionPolicy Bypass -File install.ps1 -ClaudeCode -Test -Yes
    powershell -ExecutionPolicy Bypass -File install.ps1 -Cursor -Test -Yes
    ```
-   - `[ OK ] smoke test passed` means a background Blender started, ran code, measured, rendered and stopped.
+   - `[ OK ] smoke test passed` means a background Blender started, ran code, measured, rendered and stopped; `[ OK ] window test passed` means a Blender window can open here.
+   - `[WARN] a Blender WINDOW could not be opened here`: re-run the same command with `-Background` (agents then work without windows by default).
    - `several Claude Desktop configs found`: show the list to the user and re-run with `-Config "<chosen path>"`.
    - `is not valid JSON` / `is not a JSON object`: the client's config is broken; show the user the path, nothing was changed.
 4. **Restart the client** — new MCP servers load only at startup:
@@ -94,7 +102,7 @@ Follow these steps exactly. Stop and tell the user if a step fails; do not impro
    - Cursor: restart or reload the window, then enable `blender-hub` in Settings → MCP.
 5. **Verify after restart:**
    1. `hub_list_workers()` → `{}` on a fresh install.
-   2. `hub_acquire(mode="exclusive", label="install-check")` → note `worker` and `token`.
+   2. `hub_acquire(mode="exclusive", label="install-check", gui=false)` → note `worker` and `token` (`gui=false` so the check does not leave a window open).
    3. `hub_exec(worker=<worker>, token=<token>, agent="install-check", code="result = bpy.app.version_string")` → the Blender version.
    4. `hub_release(worker=<worker>, token=<token>)`.
 
@@ -108,8 +116,8 @@ powershell -ExecutionPolicy Bypass -File install.ps1 -ClaudeDesktop -Uninstall -
 ## For AI assistants: how to use the tools
 ### The workflow
 ```
-hub_acquire(mode="exclusive" | "shared", label="what you are doing", gui=false)
-      -> {worker, token}                       # keep BOTH for the whole task
+hub_acquire(mode="exclusive" | "shared", label="what you are doing")
+      -> {worker, token}                       # opens a Blender window the user watches; keep BOTH for the whole task
 hub_exec(worker, token, agent="YourName", code="...")
       -> first call also returns agent_key     # keep it: needed to resume the agent later
 hub_turntable(worker, token, agent="YourName", collection="Agent_YourName")
@@ -134,22 +142,23 @@ hub_release(worker, token)   # when you are done
 - **Exclusive** = you alone (the `"base"` objects from an opened `.blend` are yours too). **Shared** = several leases; nobody can upgrade to exclusive while others are inside.
 - **Timeouts:** `hub_exec` has `timeout` (default 120 s, max 1800). Long C-level calls cannot be interrupted; if a worker is stuck, use `hub_kill_worker` (allowed only for the sole lease holder or after the job's own deadline + 60 s).
 - **Reviewing your work:** `hub_turntable(worker, token, agent="<you>", collection="Agent_<you>", views=12)` returns one contact-sheet image with 12 angles (low to high). Use it instead of many single captures.
-- **When the user wants to watch:** acquire with `gui=true`. Then call `hub_view(collection=...)` after a meaningful step so their viewport frames your work, and `hub_screenshot` to see exactly what they see.
+- **Live by default:** `hub_acquire` / `hub_start_worker` open a Blender **window** unless you pass `gui=false` (server default `BLENDER_HUB_GUI_DEFAULT=1`). One window per session: call `hub_view(collection=...)` after a meaningful step so the user's viewport frames your work, and `hub_screenshot` to see exactly what they see. Use `gui=false` for background or many-parallel batch work.
+- **When you finish:** `hub_release`, then ask the user whether to close the window (`hub_stop_worker`). Windows never close on their own, are never recycled, and count against both the pool limit (10) and the window cap (4); when a limit is hit, the error lists the open windows to close.
 - **Errors are actionable**: `your lease expired` → `hub_lease(worker, mode=<your original mode>)` for a new token, then pass `agent_key` in your next `hub_exec` / `hub_turntable` / `hub_export_collection`; `requires a valid lease token ... was RECYCLED ...` → `hub_restore_archive(archive)`; `already exists: resuming it requires its agent_key` → use your key, or `hub_agent_key` with a token that still uses the agent.
 - Never stop or kill a worker another session is using; the hub refuses, so do not try to work around it.
 
 ### Typical multi-agent setup
-1. A lead agent acquires one **shared** worker (`gui=true` if the user wants to watch) and shares `worker` with the other agents.
+1. A lead agent acquires one **shared** worker (a window by default, so the user watches everyone build; `gui=false` for headless) and shares `worker` with the other agents.
 2. Every agent calls `hub_lease(worker, mode="shared", label=...)` to get its own token, then works only in `Agent_<name>`.
 3. Parts are fitted with `hub_measure`; each agent reviews its part with `hub_turntable`.
-4. To produce a final file: every agent `hub_export_collection(...)` → the lead acquires an **exclusive** worker → `hub_merge(paths=[...])` → `hub_save(path)`.
+4. To produce a final file: every agent `hub_export_collection(...)` → the lead acquires an **exclusive** worker (`gui=false`: no extra window just to merge) → `hub_merge(paths=[...])` → `hub_save(path)`.
 
-For fully independent tasks (10 different assets), give each agent its own **exclusive** `hub_acquire`; they run truly in parallel.
+For fully independent tasks (10 different assets), give each agent its own **exclusive** `hub_acquire`; they run truly in parallel (pass `gui=false` unless the user wants 10 windows).
 
 ## Tool reference
 | Tool | Purpose |
 |---|---|
-| `hub_acquire` | Get a free worker from the pool (or start one) and lease it. Args: `mode`, `label`, `blend`, `ttl`, `gui`. Returns `worker`, `token`. |
+| `hub_acquire` | Get a free worker from the pool (or start one) and lease it. Opens a window by default. Args: `mode`, `label`, `blend`, `ttl`, `gui` (default true). Returns `worker`, `token`. |
 | `hub_lease` | Join a specific worker (e.g. a shared scene). Default `mode` is `exclusive`; pass `shared` to join others. Returns a token. |
 | `hub_renew` / `hub_release` | Renew / release only your own lease. |
 | `hub_exec` | Run Python in Blender as `agent` (required). Args: `code`, `timeout`, `agent_key`. |
@@ -162,7 +171,7 @@ For fully independent tasks (10 different assets), give each agent its own **exc
 | `hub_save` | Save the worker's file (copy by default; in-place needs exclusive). |
 | `hub_agent_key` | Get a new `agent_key` for an agent your token is currently using. |
 | `hub_list_workers` | Status of all workers: leases, agents, owners, busy job, RAM, autosave. Never blocks on long jobs. |
-| `hub_start_worker` / `hub_stop_worker` / `hub_restart_worker` | Lifecycle (stop refuses while other sessions hold leases; restart loads the newest autosave). |
+| `hub_start_worker` / `hub_stop_worker` / `hub_restart_worker` | Lifecycle (stop refuses while other sessions hold leases; restart loads the newest autosave and keeps the window mode, also after the user closed the window). |
 | `hub_kill_worker` | Kill a stuck worker and restart it from its autosave (sole lease holder, or job overdue). |
 | `hub_list_archives` / `hub_restore_archive` | Work archived when a worker was recycled or its name reused; restore it into a new worker with its agent keys. |
 
@@ -172,7 +181,7 @@ python examples\demo_live.py          # opens a Blender window; two agents build
 python examples\demo_live.py --close  # close it
 ```
 The demo uses your real pool: its worker `live` takes one slot of the limit until you close it.
-With `gui=true` the worker runs inside a normal Blender window: commands are served by a timer (≤ 30 ms per tick), so the UI stays responsive and you can orbit while agents work. Extra safety in window mode:
+Window mode is the default for the MCP tools (`gui=false` or `BLENDER_HUB_GUI_DEFAULT=0` for background). The worker runs inside a normal Blender window: commands are served by a timer (≤ 30 ms per tick), so the UI stays responsive and you can orbit while agents work. Extra safety in window mode:
 - your Edit/Sculpt mode is exited before an agent command (otherwise leaving Edit Mode would overwrite the agent's mesh change);
 - autosave ~5 s after any change, including your own manual edits (not during animation playback); 20 autosaves kept;
 - closing with the window's X asks "Save?" as usual; pool recycling never closes a window.
@@ -186,6 +195,8 @@ Environment variables (set them in the MCP entry's `env`):
 |---|---|---|
 | `BLENDER_EXE` | auto-detect | Blender executable |
 | `BLENDER_HUB_STATE` | `%LOCALAPPDATA%\blender-hub` | registry, logs, autosaves, archives, renders |
+| `BLENDER_HUB_MAX_WINDOWS` | `4` | cap on open windows (they never idle-exit) |
+| `BLENDER_HUB_GUI_DEFAULT` | `1` | MCP tools open a window unless `gui=false`; `0` makes background the default (the Python API always defaults to background) |
 | `BLENDER_HUB_PORT_BASE` | `9881` | first worker port (9876 is always skipped) |
 | `BLENDER_HUB_MAX_WORKERS` | `10` | pool limit |
 | `BLENDER_HUB_MIN_FREE_MB` | `1500` | do not start a worker below this free RAM |
@@ -203,7 +214,7 @@ Environment variables (set them in the MCP entry's `env`):
 ```powershell
 python tests\test_suite.py --max-workers 10 --jobs 20
 ```
-Uses its own state folder and ports **9981+**, so it never touches real workers or your Blender. It starts up to 10 Blenders (needs ~3 GB free RAM), briefly opens one visible Blender window for the window-mode checks, and takes about 3 minutes. 120 checks: pool, identity, leases, 18 kinds of cross-agent changes, false-alarm cases, watchdog, kill, autosave/restore, measure accuracy, turntable, window mode, MCP stdio protocol. Results go to `tests/results/`.
+Uses its own state folder and ports **9981+**, so it never touches real workers or your Blender. It starts up to 10 Blenders (needs ~3 GB free RAM), briefly opens a few visible Blender windows (window-mode and MCP-default checks), and takes about 4 minutes. 125 checks: pool, identity, leases, 18 kinds of cross-agent changes, false-alarm cases, watchdog, kill, autosave/restore, measure accuracy, turntable, window mode, MCP stdio protocol. Results go to `tests/results/`.
 
 ## How it works / limits
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the design, the guarantees and the known limits (no undo in background Blender, C calls cannot be interrupted, scene-wide settings are shared, detection cost ≈ 45 ms per command with 20k vertices owned by others).

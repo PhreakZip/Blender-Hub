@@ -22,6 +22,7 @@ ROOT = os.path.dirname(HERE)
 sys.path.insert(0, ROOT)
 os.environ["BLENDER_HUB_STATE"] = os.path.join(tempfile.gettempdir(), "blender-hub-bench-state")
 os.environ["BLENDER_HUB_PORT_BASE"] = "9981"
+os.environ["BLENDER_HUB_GUI_DEFAULT"] = "1"  # the suite checks the shipped default, whatever the dev's env says
 os.environ.setdefault("BLENDER_HUB_IDLE", "600")
 import hub as hubmod  # noqa: E402
 from hub import Hub, free_mb  # noqa: E402
@@ -755,6 +756,30 @@ bpy.app.timers.register(_edit_like_user, first_interval=1.0)
     H.call("window1", "release", token=tg)
     rec = _safe(lambda: H._recycle_one({"window1": H.workers()["window1"]}))
     check("window: pool recycling never picks a windowed worker", rec is None and hubmod._is_our_worker(gw), rec)
+    # window cap: with the cap reached, a new window is refused with the list of windows to close
+    old_cap = hubmod.MAX_WINDOWS
+    hubmod.MAX_WINDOWS = 1
+    capped = _safe(lambda: Hub().acquire("exclusive", label="cap", gui=True))
+    hubmod.MAX_WINDOWS = old_cap
+    check("window cap: new window refused, error names the open windows and gui=false",
+          isinstance(capped, dict) and "window limit" in capped.get("error", "") and "window1" in capped.get("error", "")
+          and "gui=false" in capped.get("error", ""), capped)
+    # kill of a windowed worker brings it back WITH a window
+    tk = res(H.call("window1", "lease", mode="exclusive", label="kill-gui"), "lease kill gui")["token"]
+    kg = _safe(lambda: H.kill_worker("window1", token=tk))
+    st_k = H.status("window1") if isinstance(kg, dict) and kg.get("killed") else {}
+    check("window: hub_kill_worker restarts it as a window", st_k.get("gui") is True, (kg, st_k.get("gui")))
+    # the user closes the window (process gone, registry entry cleaned): restart keeps the window mode
+    wk = H.workers().get("window1") or {}
+    if wk.get("pid"):
+        subprocess.run(["taskkill", "/PID", str(wk["pid"]), "/F"], capture_output=True)
+        time.sleep(1.5)
+    H.workers(clean=True)
+    rr = _safe(lambda: H.restart_worker("window1"))
+    st_r = H.status("window1") if isinstance(rr, dict) and rr.get("name") else {}
+    check("window: restart after the user closed it keeps the window (meta.json next to the autosaves)",
+          st_r.get("gui") is True, (rr, st_r.get("gui")))
+    gw = H.workers().get("window1") or gw
     t0 = time.perf_counter()
     H.stop_worker("window1")
     stop_s = time.perf_counter() - t0
@@ -811,6 +836,15 @@ bpy.app.timers.register(_edit_like_user, first_interval=1.0)
     data = json.loads(acq["result"]["content"][0]["text"]) if acq and not acq["result"].get("isError") else {}
     check("mcp: hub_acquire returns worker and token", data.get("token") and data.get("worker"), acq)
     mw, mt = data.get("worker"), data.get("token")
+    # live window is the MCP default: hub_acquire without gui opens a windowed worker
+    check("mcp: hub_acquire without gui opens a window by default (live)", mw and H.status(mw).get("gui") is True,
+          H.status(mw).get("gui") if mw else None)
+    check("gui default: omitted -> window, gui=false -> background, env 0 turns the default off",
+          hubmod._gui_arg({}) is True and hubmod._gui_arg({"gui": False}) is False and hubmod._gui_arg({"gui": True}) is True
+          and hubmod._gui_arg({"gui": "false"}) is False and hubmod._gui_arg({"gui": "true"}) is True
+          and subprocess.run([sys.executable, "-c", "import sys; sys.path.insert(0, sys.argv[1]); import hub; "
+                              "print(hub._gui_arg({}))", ROOT], capture_output=True, text=True,
+                             env=dict(os.environ, BLENDER_HUB_GUI_DEFAULT="0")).stdout.strip() == "False")
     send({"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "hub_exec", "arguments": {
         "worker": mw, "token": mt, "agent": "M", "code": "bpy.ops.mesh.primitive_monkey_add(); bpy.ops.object.shade_flat(); result = 'ç ã ok'"}}})
     e4 = wait(4)
