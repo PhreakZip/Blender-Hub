@@ -51,6 +51,7 @@ MCP client (Claude Desktop/Code, Cursor...) --stdio--> hub.py (MCP server, state
 
 ## Live panel and modules
 - Window workers register a `POST_PIXEL` draw handler on every 3D view that prints `_overlay_lines()` (the same data the network thread returns in `status.overlay`): leases, the agents bound to them, the running command and each agent's last activity. The timer tick redraws the 3D views once a second so the clocks move.
+- What each agent is doing lives in `AGENT_INFO` (memory only): `task` from `hub_note`, `step` from `note=` on agent-bound commands, and, for exec/claim, `last_change` + `stats` computed by comparing a cheap signature of the agent's own collection (type, vertex/face counts, `matrix_basis`, data name, modifier count) before and after the command.
 - `BLENDER_HUB_MODULES` files are executed into their own dicts and injected into each `hub_exec` namespace by name; they are re-executed when the file's mtime changes.
 
 ## Measure

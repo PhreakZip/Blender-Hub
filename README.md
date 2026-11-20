@@ -119,8 +119,9 @@ powershell -ExecutionPolicy Bypass -File install.ps1 -ClaudeDesktop -Uninstall -
 ```
 hub_acquire(mode="exclusive" | "shared", label="what you are doing")   # label is required: it is shown live
       -> {worker, token}                       # opens a Blender window the user watches; keep BOTH for the whole task
-hub_exec(worker, token, agent="YourName", code="...")
-      -> first call also returns agent_key     # keep it: needed to resume the agent later
+hub_note(worker, token, agent="YourName", task="house 3 roof: eaves and gutters")   # what you are working on
+      -> the FIRST call that names your agent (hub_note, hub_exec, ...) returns agent_key: keep it (needed to resume)
+hub_exec(worker, token, agent="YourName", code="...", note="modeling the left gutter")  # what this step does
 hub_turntable(worker, token, agent="YourName", collection="Agent_YourName")
 hub_measure(worker, token, a=..., b=...)  /  hub_view / hub_screenshot
 hub_export_collection(worker, token, agent="YourName", collection="Agent_YourName", path="C:\\...\\part.blend")
@@ -128,7 +129,8 @@ hub_release(worker, token)   # when you are done
 ```
 
 ### Rules that matter
-- **Always pass `token`**, and pass the **same `agent` name** to `hub_exec`, `hub_turntable` and `hub_export_collection` for the whole task (they create/bind your agent; add `agent_key` when resuming). Store `worker`, `token` and `agent_key` somewhere you will not lose them (e.g. your notes/plan). If your context gets summarized, you need them to continue.
+- **Always pass `token`**, and pass the **same `agent` name** to `hub_note`, `hub_exec`, `hub_turntable` and `hub_export_collection` for the whole task (they create/bind your agent; add `agent_key` when resuming). Store `worker`, `token` and `agent_key` somewhere you will not lose them (e.g. your notes/plan). If your context gets summarized, you need them to continue.
+- **Say what you are doing:** `hub_note(task=...)` when you start (and when the task changes), and `note=...` on each `hub_exec`. The user watches these lines live in the window.
 - **Always give a `label`** (what you are doing, e.g. `"castle walls v2"`): it identifies your session in the window's live panel and in `hub_list_workers`. A lease created without one (Python API) takes the name of its first agent.
 - **Leases:** `hub_lease` / `hub_acquire` default to `mode="exclusive"` — pass `mode="shared"` to join a shared scene. A lease lasts `ttl` seconds (default 900, max 3600) and every call renews it; an agent idle for longer loses it.
 - **`hub_exec` runs Python inside Blender** with `bpy`, `bmesh`, `mathutils`, `np`, `math` available, plus:
@@ -163,7 +165,8 @@ For fully independent tasks (10 different assets), give each agent its own **exc
 | `hub_acquire` | Get a free worker from the pool (or start one) and lease it. Opens a window by default. Args: `mode`, `label`, `blend`, `ttl`, `gui` (default true). Returns `worker`, `token`. |
 | `hub_lease` | Join a specific worker (e.g. a shared scene). Default `mode` is `exclusive`; pass `shared` to join others. Returns a token. |
 | `hub_renew` / `hub_release` | Renew / release only your own lease. |
-| `hub_exec` | Run Python in Blender as `agent` (required). Args: `code`, `timeout`, `agent_key`. |
+| `hub_exec` | Run Python in Blender as `agent` (required). Args: `code`, `timeout`, `agent_key`, `note` (what this step does, shown live). |
+| `hub_note` | Declare the task you are working on (`task`); shown live in the window's panel and in `hub_list_workers`. |
 | `hub_measure` | Min distance, intersecting faces, penetration (ray-parity), manifold flags and `delta_a_to_b` between two objects. `tol` = edge sample spacing. |
 | `hub_turntable` | N renders around the target (Workbench) + a contact sheet returned as an image. `agent` required; `views` 1–48 (default 12), `size` 64–1024 (default 256). |
 | `hub_view` | Window mode: frame the viewport on a collection/objects (keeps the user's selection). |
@@ -192,12 +195,17 @@ In window mode **you own everything**: your manual edits are not reported as vio
 
 **Live panel.** Every window shows, at the bottom-left of the 3D viewport (like Blender's own statistics overlay), how many agents are working in that Blender and who they are, updated every second:
 ```
-Blender Hub  w1  |  3 agents working
-castle    ·  running exec 3s  ·  lease 'castle walls v2' exclusive            (green: running now)
-walls     ·  active, last command 12s ago  ·  lease 'walls' shared            (white: active in the last minute)
-props     ·  idle 6m  ·  lease 'props pass' shared                            (grey: idle)
+Blender Hub  w1  |  2 agents working
+roof  ·  house 3 roof: eaves and gutters  ·  running exec 3s  ·  lease 'house 3' shared       (green: running now)
+      step: modeling the left gutter (3s ago)  ·  last: +2 (gutter_l, gutter_r) 40s ago  ·  14 objects, 8,240 faces
+wall  ·  active, last command 12s ago  ·  lease 'garden wall' shared                          (white: active in the last minute; grey when idle)
+      last: +1 (brick_17) 12s ago  ·  17 objects, 102 faces
 ```
-The same lines are in `hub_list_workers` (`overlay`). Turn it off with `BLENDER_HUB_OVERLAY=0`.
+- **Task** (`hub_note(task=...)`) and **step** (`note=` on `hub_exec` / `hub_turntable` / `hub_export_collection`) are what the agent says it is doing.
+- **last** and the totals are seen by the hub itself after every command (objects added, `~` changed, `-` removed in the agent's collection), so you see what an agent did even if it never writes a note. It is approximate: `~` compares counts, transform, mesh and modifiers, so an edit that keeps vertex/face counts (or only changes a material) shows no `~`. Kept in memory only (reset when the worker restarts).
+- At most 8 agents are listed (running first, then the most recent); the rest are summarized as `+N more`.
+
+The same lines are in `hub_list_workers` (`overlay`, plus `agents_info` as data). Turn the panel off with `BLENDER_HUB_OVERLAY=0`.
 
 ## Shared modules (your kit in every hub_exec)
 Point `BLENDER_HUB_MODULES` at Python files and every worker loads them into the `hub_exec` namespace — no more pasting a 2000-line helper kit into each call:
@@ -236,7 +244,7 @@ Environment variables (set them in the MCP entry's `env`):
 ```powershell
 python tests\test_suite.py --max-workers 10 --jobs 20
 ```
-Uses its own state folder and ports **9981+**, so it never touches real workers or your Blender. It starts up to 10 Blenders (needs ~3 GB free RAM), briefly opens a few visible Blender windows (window-mode and MCP-default checks), and takes about 4 minutes. 133 checks: pool, identity, leases, 18 kinds of cross-agent changes, false-alarm cases, watchdog, kill, autosave/restore, measure accuracy, turntable, window mode, MCP stdio protocol. Results go to `tests/results/`.
+Uses its own state folder and ports **9981+**, so it never touches real workers or your Blender. It starts up to 10 Blenders (needs ~3 GB free RAM), briefly opens a few visible Blender windows (window-mode and MCP-default checks), and takes about 4 minutes. 135 checks: pool, identity, leases, 18 kinds of cross-agent changes, false-alarm cases, watchdog, kill, autosave/restore, measure accuracy, turntable, window mode, MCP stdio protocol. Results go to `tests/results/`.
 
 ## How it works / limits
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the design, the guarantees and the known limits (no undo in background Blender, C calls cannot be interrupted, scene-wide settings are shared, detection cost ≈ 45 ms per command with 20k vertices owned by others).

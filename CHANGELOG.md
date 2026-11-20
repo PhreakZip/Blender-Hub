@@ -1,5 +1,8 @@
 # Changelog
 
+## 0.9.0 — 2026-11-19
+- The live panel shows what each agent is doing: its declared task (new `hub_note`), the current step (`note=` on `hub_exec` / `hub_turntable` / `hub_export_collection`), and — seen by the hub itself after every command — what changed in its collection (objects added / changed / removed) plus its object and face totals. Also in `hub_list_workers` (`agents_info`).
+
 ## 0.8.0 — 2026-11-19
 - Live panel in every window (bottom-left of the 3D viewport): worker name, how many agents are working, and per agent whether it is running a command, active or idle, with its lease. Same lines in `hub_list_workers` (`overlay`); `BLENDER_HUB_OVERLAY=0` hides it.
 - `label` is required on the MCP `hub_acquire` / `hub_lease`; a lease created without one is named after its first agent.

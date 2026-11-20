@@ -759,6 +759,19 @@ bpy.data.images.remove(img)
           texts)
     labels = [p["label"] for p in H.status("window1").get("participants", [])]
     check("unnamed lease is named after its first agent", "G2" in labels, labels)
+    # what each agent is doing: declared task (hub_note) + step (note=) + changes the hub sees by itself
+    rn = H.call("window1", "note", token=tg2, agent="G2", agent_key=KEYS.get("G2"), task="garden wall: first course")
+    ex("window1", tg2, "G2", "bpy.ops.mesh.primitive_cube_add(location=(9, 0, 0)); bpy.context.object.name = 'brick_a'\n"
+       "bpy.ops.mesh.primitive_cube_add(location=(11, 0, 0)); bpy.context.object.name = 'brick_b'", note="laying two bricks")
+    st_n = H.status("window1")
+    ovl = [t for t, _ in st_n.get("overlay") or []]
+    g2 = (st_n.get("agents_info") or {}).get("G2") or {}
+    check("panel shows the declared task and step of each agent",
+          rn.get("ok") and any(t.startswith("G2") and "garden wall: first course" in t for t in ovl)
+          and any("step: laying two bricks" in t for t in ovl), ovl)
+    check("panel shows what the agent changed (seen by the hub, no note needed) and its totals",
+          any("+2 (brick_a, brick_b)" in t for t in ovl) and g2.get("stats", {}).get("objects") == 2
+          and g2.get("last_change", {}).get("n_added") == 2, (ovl, g2))
     H.call("window1", "release", token=tg2)
     vw = H.call("window1", "view", token=tg, collection="Agent_G", shading="MATERIAL")
     sh = H.call("window1", "screenshot", token=tg)

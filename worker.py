@@ -53,7 +53,7 @@ try:
 except Exception:
     np = None
 
-VERSION = "0.8.0"
+VERSION = "0.9.0"
 LEASE_TTL_DEFAULT = 900.0
 LEASE_TTL_MAX = 3600.0
 NET_CMDS = {"ping", "status", "check_token"}   # answered outside the queue, without bpy
@@ -97,6 +97,7 @@ STATUS = {"busy": None, "busy_since": None, "busy_token": None, "busy_deadline":
           "started": time.time(), "objects": 0, "owners": {}, "gui": not bpy.app.background}
 JOBS = queue.Queue()
 AGENT_LAST = {}                # agent -> time of its last command (live overlay)
+AGENT_INFO = {}                # agent -> {"task", "step", "step_at", "last_change", "stats"} (what it is doing)
 MODULES = {}                   # name -> {"path", "mtime", "ns" (dict) or None, "error"}
 RUNNING = True
 MAIN_TID = threading.get_ident()
@@ -816,6 +817,48 @@ def cmd_screenshot(req):
     return {"path": path}
 
 
+def _clean_text(v, n=120):
+    """One line for the panel: newlines and control characters become spaces (blf draws them badly)."""
+    return " ".join("".join(ch if ch.isprintable() else " " for ch in str(v or "")).split())[:n]
+
+
+def cmd_note(req):
+    """hub_note: the agent declares its current task (shown in the live panel and in status)."""
+    task = _clean_text(req.get("task"))
+    with LOCK:
+        AGENT_INFO.setdefault(req["_agent"], {})["task"] = task or None
+    return {"agent": req["_agent"], "task": task or None}
+
+
+def _own_sig(agent):
+    """Cheap signature of the agent's own objects: what it added, removed or changed in a command."""
+    coll = bpy.data.collections.get(f"Agent_{agent}") if agent else None
+    out = {}
+    if coll is None:
+        return out
+    for ob in coll.all_objects:
+        me = ob.data if ob.type == "MESH" else None
+        out[ob.name] = (ob.type, len(me.vertices) if me else 0, len(me.polygons) if me else 0,
+                        tuple(round(v, 4) for row in ob.matrix_basis for v in row), ob.data.name if ob.data else None,
+                        len(ob.modifiers))
+    return out
+
+
+def _record_change(agent, before):
+    after = _own_sig(agent)
+    added = sorted(set(after) - set(before))
+    removed = sorted(set(before) - set(after))
+    changed = sorted(n for n in set(after) & set(before) if after[n] != before[n])
+    faces = sum(v[2] for v in after.values())
+    with LOCK:
+        info = AGENT_INFO.setdefault(agent, {})
+        if added or removed or changed:
+            info["last_change"] = {"added": added[:20], "removed": removed[:20], "changed": changed[:20],
+                                   "n_added": len(added), "n_removed": len(removed), "n_changed": len(changed),
+                                   "at": time.time()}
+        info["stats"] = {"objects": len(after), "faces": faces}
+
+
 def cmd_claim(req):
     return {"collection": _agent_coll(req["_agent"]).name}
 
@@ -1210,7 +1253,7 @@ def cmd_quit(req):
 
 CMDS = {k[4:]: v for k, v in list(globals().items()) if k.startswith("cmd_")}
 TOUCHES_SCENE = {"exec", "claim", "merge"}
-NEEDS_AGENT = {"exec", "claim", "turntable", "export_collection"}
+NEEDS_AGENT = {"exec", "claim", "turntable", "export_collection", "note"}
 
 
 def dispatch(req):
@@ -1225,6 +1268,10 @@ def dispatch(req):
             req["_agent"], key, warn = _bind_agent(req, token)
             STATUS["busy_agent"] = req["_agent"]
             AGENT_LAST[req["_agent"]] = time.time()
+            step = _clean_text(req.get("note"))
+            if step and cmd != "note":  # what this command does, declared by the agent
+                with LOCK:
+                    AGENT_INFO.setdefault(req["_agent"], {}).update(step=step, step_at=time.time())
             if key:
                 extra["agent_key"] = key
             if warn:
@@ -1238,10 +1285,19 @@ def dispatch(req):
     if cmd == "exec":  # (re)load modules BEFORE the ownership snapshot: their import is nobody's change
         _load_modules(req.get("_agent"))
     before = _snapshot(req.get("_agent"), exclusive) if cmd in TOUCHES_SCENE else None
+    own_before = None
+    if cmd in ("exec", "claim"):
+        try:
+            own_before = _own_sig(req.get("_agent"))
+        except Exception:  # unusual object data must never fail the command itself
+            own_before = None
     # job deadline, exposed in status: a timeout kill only applies after it (+ margin)
     limit = {"exec": min(max(float(req.get("timeout", 120)), 1.0), 1800.0), "turntable": 1800.0}.get(cmd, 600.0)
     STATUS["busy_deadline"] = time.time() + limit
     result = fn(req)
+    if own_before is not None:  # seen by the hub itself, even if the agent never says what it does
+        with contextlib.suppress(Exception):
+            _record_change(req["_agent"], own_before)
     if before is not None:
         viol = _diff(req.get("_agent"), before)
         if viol:
@@ -1299,6 +1355,7 @@ def _status():
             "busy_overdue_s": round(time.time() - STATUS["busy_deadline"], 1) if STATUS["busy"] and STATUS["busy_deadline"] else None,
             "queue": JOBS.qsize(), "participants": parts, "agents": agents, "owners": owners, "key_reissues": reissues,
             "modules": _modules_view(),
+            "agents_info": _agents_info_view(),
             "overlay": _overlay_lines(),
             "commands": STATUS["commands"], "objects": STATUS["objects"], "autosave": STATUS["autosave_path"],
             "idle_s": round(time.time() - STATUS["last_activity"], 1), "uptime_s": round(time.time() - STATUS["started"], 1)}
@@ -1413,6 +1470,37 @@ def _ago(t):
     return f"{s}s" if s < 60 else (f"{s // 60}m" if s < 3600 else f"{s // 3600}h{(s % 3600) // 60:02d}")
 
 
+def _agents_info_view():
+    with LOCK:
+        return {a: dict(v) for a, v in AGENT_INFO.items()}
+
+
+def _cut(text, n):
+    return text if len(text) <= n else text[:n - 1] + "…"
+
+
+def _detail_line(info):
+    """'step: ... · last: +2 (roof, gutter) ~3 -1 · 14 objects, 8,240 faces' (empty if nothing known)."""
+    bits = []
+    if info.get("step"):
+        bits.append(f"step: {_cut(info['step'], 60)} ({_ago(info.get('step_at') or time.time())} ago)")
+    ch = info.get("last_change")
+    if ch:
+        parts = []
+        if ch["n_added"]:
+            names = ", ".join(ch["added"][:3]) + ("…" if ch["n_added"] > 3 else "")
+            parts.append(f"+{ch['n_added']} ({_cut(names, 40)})")
+        if ch["n_changed"]:
+            parts.append(f"~{ch['n_changed']}")
+        if ch["n_removed"]:
+            parts.append(f"-{ch['n_removed']}")
+        bits.append("last: " + " ".join(parts) + f" {_ago(ch['at'])} ago")
+    st = info.get("stats")
+    if st:
+        bits.append(f"{st['objects']} objects, {st['faces']:,} faces")
+    return "  ·  ".join(bits)
+
+
 def _overlay_lines():
     """[(text, kind)] for the live panel: kind = title | busy | active | idle | dim. Works without bpy."""
     _gc_leases()
@@ -1423,6 +1511,7 @@ def _overlay_lines():
         busy_tok, busy_cmd, busy_agent = STATUS.get("busy_token"), STATUS.get("busy"), STATUS.get("busy_agent")
         busy_since = STATUS.get("busy_since")
         last = dict(AGENT_LAST)
+        infos = {a: dict(v) for a, v in AGENT_INFO.items()}
     by_tok = {}
     for a, t in agents.items():
         by_tok.setdefault(t, []).append(a)
@@ -1431,7 +1520,11 @@ def _overlay_lines():
     if len(parts) != len(by_tok):
         head += f", {len(parts)} lease{'s' if len(parts) != 1 else ''}"
     lines = [(head, "title")]
-    for a in working:
+    MAX_SHOWN = 8  # the panel must fit the viewport: busy agents first, then the most recent
+    order = sorted(working, key=lambda a: (not (busy_tok == agents[a] and busy_cmd and busy_agent in (None, a)),
+                                           -(last.get(a) or 0)))
+    hidden = order[MAX_SHOWN:]
+    for a in order[:MAX_SHOWN]:
         t = agents[a]
         p = parts.get(t, {})
         lease = f"'{p.get('label', '?')}' {p.get('mode', '')}".strip()
@@ -1441,7 +1534,14 @@ def _overlay_lines():
             state, kind = f"active, last command {_ago(last[a])} ago", "active"
         else:
             state, kind = (f"idle {_ago(last[a])}" if a in last else "idle"), "idle"
-        lines.append((f"{a}  ·  {state}  ·  lease {lease}", kind))
+        info = infos.get(a, {})
+        task = f"  ·  {_cut(info['task'], 50)}" if info.get("task") else ""
+        lines.append((_cut(f"{a}{task}  ·  {state}  ·  lease {lease}", 140), kind))
+        detail = _detail_line(info)
+        if detail:
+            lines.append((_cut("      " + detail, 140), "detail"))
+    if hidden:
+        lines.append((f"+{len(hidden)} more: " + ", ".join(sorted(hidden)[:10]), "dim"))
     for t, p in parts.items():
         if t not in by_tok:
             lines.append((f"lease '{p['label']}' ({p['mode']}) with no agent yet", "dim"))
@@ -1451,7 +1551,8 @@ def _overlay_lines():
 
 
 _OVERLAY_COLORS = {"title": (1.0, 0.82, 0.35, 1.0), "busy": (0.45, 1.0, 0.45, 1.0), "active": (0.9, 0.95, 1.0, 1.0),
-                   "idle": (0.62, 0.66, 0.72, 1.0), "dim": (0.55, 0.57, 0.6, 1.0)}
+                   "idle": (0.62, 0.66, 0.72, 1.0), "dim": (0.55, 0.57, 0.6, 1.0),
+                   "detail": (0.78, 0.82, 0.88, 1.0)}
 
 
 def _draw_overlay():
