@@ -778,6 +778,11 @@ bpy.data.images.remove(img)
     sp = (sh.get("result") or {}).get("path")
     check("window: hub_view frames and hub_screenshot saves the capture", vw.get("ok") and sp and os.path.getsize(sp) > 10000,
           (vw.get("error"), sh.get("error")))
+    shr = sh.get("result") or {}
+    shf = (H.call("window1", "screenshot", token=tg, full=True).get("result") or {})
+    check("tokens: screenshot = 3D viewport only, longest side <= 1024 by default; full=true gives the window",
+          shr.get("area") == "viewport" and max(shr.get("size") or [9999]) <= 1024 and shf.get("area") == "window",
+          (shr.get("size"), shr.get("area"), shf.get("area"), shf.get("size")))
     r = ex("window1", tg, "G", "while True: pass", timeout=2)
     check("window: the watchdog timeout also works with a window", r["ok"] and "_Timeout" in ((r.get("result") or {}).get("error") or ""),
           (r.get("result") or {}).get("error", r.get("error")))
@@ -909,6 +914,14 @@ bpy.app.timers.register(_edit_like_user, first_interval=8.0)
     # live window is the MCP default: hub_acquire without gui opens a windowed worker
     check("mcp: hub_acquire without gui opens a window by default (live)", mw and H.status(mw).get("gui") is True,
           H.status(mw).get("gui") if mw else None)
+    send({"jsonrpc": "2.0", "id": 40, "method": "tools/call", "params": {"name": "hub_list_workers", "arguments": {}}})
+    send({"jsonrpc": "2.0", "id": 41, "method": "tools/call", "params": {"name": "hub_list_workers", "arguments": {"verbose": True}}})
+    t40, t41 = wait(40), wait(41)
+    short_txt = t40["result"]["content"][0]["text"] if t40 else ""
+    long_txt = t41["result"]["content"][0]["text"] if t41 else ""
+    check("tokens: hub_list_workers is short by default (verbose=true has overlay/agents_info) and compact JSON",
+          mw in short_txt and "overlay" not in short_txt and "overlay" in long_txt and '": ' not in short_txt
+          and len(short_txt) * 3 < len(long_txt), (len(short_txt), len(long_txt)))
     check("gui default: omitted -> window, gui=false -> background, env 0 turns the default off",
           hubmod._gui_arg({}) is True and hubmod._gui_arg({"gui": False}) is False and hubmod._gui_arg({"gui": True}) is True
           and hubmod._gui_arg({"gui": "false"}) is False and hubmod._gui_arg({"gui": "true"}) is True

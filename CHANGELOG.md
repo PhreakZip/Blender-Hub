@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.10.0 — 2026-11-20
+- Token diet (typical session ~21.3k → ~11.1k tokens, measured by the new `tests/token_budget.py`):
+  - `hub_screenshot` captures only the 3D viewport and scales it to `size` px (default 1024); `full=true` for the whole window.
+  - `hub_turntable` no longer lists the 12 frame paths in its reply (the image is the answer).
+  - `hub_list_workers` is short by default (`verbose=true` for everything).
+  - Compact JSON replies, a shorter lease block, rounded `hub_measure` numbers, shorter tool descriptions and instructions.
+
 ## 0.9.0 — 2026-11-19
 - The live panel shows what each agent is doing: its declared task (new `hub_note`), the current step (`note=` on `hub_exec` / `hub_turntable` / `hub_export_collection`), and — seen by the hub itself after every command — what changed in its collection (objects added / changed / removed) plus its object and face totals. Also in `hub_list_workers` (`agents_info`).
 

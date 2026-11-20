@@ -170,12 +170,12 @@ For fully independent tasks (10 different assets), give each agent its own **exc
 | `hub_measure` | Min distance, intersecting faces, penetration (ray-parity), manifold flags and `delta_a_to_b` between two objects. `tol` = edge sample spacing. |
 | `hub_turntable` | N renders around the target (Workbench) + a contact sheet returned as an image. `agent` required; `views` 1–48 (default 12), `size` 64–1024 (default 256). |
 | `hub_view` | Window mode: frame the viewport on a collection/objects (keeps the user's selection). |
-| `hub_screenshot` | Window mode: screenshot of the Blender window, returned as an image. |
+| `hub_screenshot` | Window mode: what the user sees — by default only the 3D viewport, longest side `size` px (1024); `full=true` for the whole window. Returned as an image. |
 | `hub_export_collection` | Save your collection to a `.blend`. `agent` required. |
 | `hub_merge` | Append collections from several `.blend` files (exclusive lease). |
 | `hub_save` | Save the worker's file (copy by default; in-place needs exclusive). |
 | `hub_agent_key` | Get a new `agent_key` for an agent your token is currently using. |
-| `hub_list_workers` | Status of all workers: leases, agents, owners, busy job, RAM, autosave. Never blocks on long jobs. |
+| `hub_list_workers` | Short status of all workers (leases, agents and what they do, busy, RAM); `verbose=true` for everything (owners, modules, overlay, autosave). Never blocks on long jobs. |
 | `hub_start_worker` / `hub_stop_worker` / `hub_restart_worker` | Lifecycle (stop refuses while other sessions hold leases; restart loads the newest autosave and keeps the window mode, also after the user closed the window). |
 | `hub_kill_worker` | Kill a stuck worker and restart it from its autosave (sole lease holder, or job overdue). |
 | `hub_list_archives` / `hub_restore_archive` | Work archived when a worker was recycled or its name reused; restore it into a new worker with its agent keys. |
@@ -244,7 +244,21 @@ Environment variables (set them in the MCP entry's `env`):
 ```powershell
 python tests\test_suite.py --max-workers 10 --jobs 20
 ```
-Uses its own state folder and ports **9981+**, so it never touches real workers or your Blender. It starts up to 10 Blenders (needs ~3 GB free RAM), briefly opens a few visible Blender windows (window-mode and MCP-default checks), and takes about 4 minutes. 135 checks: pool, identity, leases, 18 kinds of cross-agent changes, false-alarm cases, watchdog, kill, autosave/restore, measure accuracy, turntable, window mode, MCP stdio protocol. Results go to `tests/results/`.
+Uses its own state folder and ports **9981+**, so it never touches real workers or your Blender. It starts up to 10 Blenders (needs ~3 GB free RAM), briefly opens a few visible Blender windows (window-mode and MCP-default checks), and takes about 4 minutes. 137 checks: pool, identity, leases, 18 kinds of cross-agent changes, false-alarm cases, watchdog, kill, autosave/restore, measure accuracy, turntable, window mode, MCP stdio protocol. Results go to `tests/results/`.
+
+## Token budget
+Images cost tokens by pixel count and stay in the conversation, so the hub keeps them small; text replies are compact JSON. Measured with `python tests/token_budget.py` (a typical modeling session: 1 acquire, 1 note, 25 exec, 4 turntables, 4 screenshots, 2 status calls; each reply counted once — images stay in the conversation, so their real cumulative cost is higher, which makes the image savings matter more):
+
+| | 0.9.0 | 0.10.0 |
+|---|---|---|
+| `hub_screenshot` (viewport only, ≤ 1024 px instead of the 1920×1009 window) | ~2,650 | ~850 |
+| `hub_turntable` (no list of frame paths in the reply) | ~1,480 | ~1,100 |
+| `hub_list_workers` (short by default) | ~300 per worker | ~50 per worker |
+| `hub_exec` reply | ~40 | ~22 |
+| tool definitions + instructions | ~3,100 | ~2,560 |
+| **typical session** | **~21,300** | **~11,100** |
+
+Tips for agents: review with one `hub_turntable` instead of several screenshots, call `hub_screenshot` only when you need to see what the user sees, and keep `result` small (return counts and names, not whole meshes).
 
 ## How it works / limits
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the design, the guarantees and the known limits (no undo in background Blender, C calls cannot be interrupted, scene-wide settings are shared, detection cost ≈ 45 ms per command with 20k vertices owned by others).

@@ -53,7 +53,7 @@ try:
 except Exception:
     np = None
 
-VERSION = "0.9.0"
+VERSION = "0.10.0"
 LEASE_TTL_DEFAULT = 900.0
 LEASE_TTL_MAX = 3600.0
 NET_CMDS = {"ping", "status", "check_token"}   # answered outside the queue, without bpy
@@ -740,11 +740,12 @@ def _gui_window():
 
 
 def _view3d(win):
-    for area in win.screen.areas:
-        if area.type == "VIEW_3D":
-            region = next((r for r in area.regions if r.type == "WINDOW"), None)
-            return area, region
-    return None, None
+    """The LARGEST 3D view of the window (a split layout may have a small one first)."""
+    areas = [a for a in win.screen.areas if a.type == "VIEW_3D"]
+    if not areas:
+        return None, None
+    area = max(areas, key=lambda a: a.width * a.height)
+    return area, next((r for r in area.regions if r.type == "WINDOW"), None)
 
 
 def _redraw():
@@ -804,17 +805,45 @@ def cmd_view(req):
 
 
 def cmd_screenshot(req):
-    """Window mode: screenshot of the whole Blender window (what the user is seeing)."""
+    """Window mode: what the user is seeing. By default only the 3D viewport, scaled so its longest side is
+    `size` px (default 1024): image tokens grow with pixels, and the panels around the viewport rarely matter.
+    full=true captures the whole window."""
     win = _gui_window()
     out_dir = os.path.join(ARGS["state"], "renders", ARGS["name"])
     os.makedirs(out_dir, exist_ok=True)
     path = os.path.join(out_dir, f"screen_{int(time.time() * 1000)}.png")
+    size = min(max(int(req.get("size") or 1024), 256), 2048)
+    full = bool(req.get("full"))
     _redraw()
+    area, region = (None, None) if full else _view3d(win)
     with bpy.context.temp_override(window=win):
         with contextlib.suppress(Exception):  # actually draw now (otherwise the screenshot may show the previous scene)
             bpy.ops.wm.redraw_timer(type="DRAW_WIN_SWAP", iterations=1)
-        bpy.ops.screen.screenshot(filepath=path)
-    return {"path": path}
+    if area is not None:
+        with bpy.context.temp_override(window=win, area=area, region=region):
+            bpy.ops.screen.screenshot_area(filepath=path)
+    else:
+        with bpy.context.temp_override(window=win):
+            bpy.ops.screen.screenshot(filepath=path)
+    w = h = None
+    img = None
+    try:
+        img = bpy.data.images.load(path, check_existing=False)
+        w, h = img.size
+        scale = size / max(w, h)
+        if scale < 1.0:
+            w, h = max(1, round(w * scale)), max(1, round(h * scale))
+            img.scale(w, h)
+            img.filepath_raw = path
+            img.file_format = "PNG"
+            img.save()
+    except Exception:
+        pass  # the unscaled capture is still valid
+    finally:
+        if img is not None:  # never leave the capture inside the user's file (Image Editor, autosaves)
+            with contextlib.suppress(Exception):
+                bpy.data.images.remove(img)
+    return {"path": path, "size": [w, h], "area": "window" if area is None else "viewport"}
 
 
 def _clean_text(v, n=120):

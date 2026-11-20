@@ -24,7 +24,7 @@ import subprocess
 import threading
 import contextlib
 
-VERSION = "0.9.0"
+VERSION = "0.10.0"
 HERE = os.path.dirname(os.path.abspath(__file__))
 WORKER = os.path.join(HERE, "worker.py")
 sys.path.insert(0, HERE)
@@ -802,63 +802,101 @@ class Hub:
 
 # ======================================================================= MCP
 S = {"type": "string"}
-TOKEN = {"type": "string", "description": "lease token returned by hub_acquire/hub_lease"}
-KEY = {"type": "string", "description": "agent_key returned on the agent's first use; only required to resume the agent after its lease expired"}
-NOTE = {"type": "string", "description": "one short line saying what this step does (e.g. 'modeling the left gutter'); shown live in the window's panel"}
+TOKEN = {"type": "string", "description": "from hub_acquire/hub_lease"}
+KEY = {"type": "string", "description": "only to resume an agent after its lease expired"}
+NOTE = {"type": "string", "description": "short line: what this step does (shown live)"}
+WIN = "(window workers)"
 TOOLS = [
-    ("hub_acquire", "Get a free Blender worker (boots a new one if needed) and lease it. By default it opens a Blender WINDOW so the user watches you work live (one window per session); pass gui=false for background/parallel batch work. Returns worker + token: keep the token, every other tool needs it. mode=exclusive (only you, default) or shared (several agents, each in its own collection). When done: hub_release, then ask the user whether to close the window (hub_stop_worker); windows never close on their own and are capped (BLENDER_HUB_MAX_WINDOWS).",
+    ("hub_acquire", "Lease a free Blender worker (boots one if needed). Opens a window the user watches live by default; gui=false for background/batch. Returns worker + token (keep both). mode: exclusive (default) | shared. When done: hub_release, then ask the user before closing the window (hub_stop_worker).",
      {"mode": {"type": "string", "enum": ["exclusive", "shared"]},
-      "label": {"type": "string", "description": "what this session is doing (e.g. 'castle walls v2'); shown live in the window and in hub_list_workers"},
-      "blend": S, "ttl": {"type": "number"},
-      "gui": {"type": "boolean", "description": "default true (server setting BLENDER_HUB_GUI_DEFAULT): windowed Blender the user can watch live; false = background"}}, ["label"]),
-    ("hub_lease", "Join a specific worker (e.g. another agent's shared one). Returns a token. Default mode=exclusive; pass mode=\"shared\" to join a worker others are using.",
+      "label": {"type": "string", "description": "what you are doing (shown live)"},
+      "blend": S, "ttl": {"type": "number"}, "gui": {"type": "boolean", "description": "default true"}}, ["label"]),
+    ("hub_lease", "Join a specific worker; returns a token. mode exclusive (default) | shared (to work next to others).",
      {"worker": S, "mode": {"type": "string", "enum": ["exclusive", "shared"]},
-      "label": {"type": "string", "description": "what this session is doing; shown live in the window"}, "ttl": {"type": "number"}}, ["worker", "label"]),
-    ("hub_renew", "Renew the lease (every command already renews it).", {"worker": S, "token": TOKEN}, ["worker", "token"]),
-    ("hub_release", "Release only your own lease.", {"worker": S, "token": TOKEN}, ["worker", "token"]),
-    ("hub_list_workers", "List live workers: leases, agents, what each is busy with, RAM, autosave. Does not wait for long-running work.", {}, []),
-    ("hub_start_worker", "Boot a worker with a chosen name and .blend (hub_acquire already does this on its own). Opens with a window by default; gui=false for background.",
-     {"name": S, "blend": S, "gui": {"type": "boolean", "description": "default true (BLENDER_HUB_GUI_DEFAULT)"}}, ["name"]),
-    ("hub_view", "Windowed worker: frame the viewport on the target (collection/objects) for whoever is watching. Optional shading (VERTEX, MATERIAL...).",
+      "label": {"type": "string", "description": "what you are doing (shown live)"}, "ttl": {"type": "number"}}, ["worker", "label"]),
+    ("hub_renew", "Renew your lease (every command already renews it).", {"worker": S, "token": TOKEN}, ["worker", "token"]),
+    ("hub_release", "Release your lease.", {"worker": S, "token": TOKEN}, ["worker", "token"]),
+    ("hub_list_workers", "Short status of every worker (leases, agents and what they do, busy, RAM). verbose=true for everything.",
+     {"verbose": {"type": "boolean"}}, []),
+    ("hub_start_worker", "Boot a worker with a name/.blend (hub_acquire does it for you). Window by default; gui=false for background.",
+     {"name": S, "blend": S, "gui": {"type": "boolean"}}, ["name"]),
+    ("hub_view", f"Frame the user's viewport on a collection/objects {WIN}. Optional shading (VERTEX, MATERIAL).",
      {"worker": S, "token": TOKEN, "collection": S, "objects": {"type": "array", "items": S}, "shading": S}, ["worker", "token"]),
-    ("hub_screenshot", "Windowed worker: screenshot of the Blender window (what the user is seeing). Returns the image.",
-     {"worker": S, "token": TOKEN}, ["worker", "token"]),
-    ("hub_stop_worker", "Stop the worker. Refused if another session holds a lease.", {"name": S, "token": TOKEN}, ["name"]),
-    ("hub_restart_worker", "Boot again a worker that died or whose window was closed, from its newest autosave. Keeps its window mode unless gui is given.",
+    ("hub_screenshot", f"What the user sees {WIN}: the 3D viewport, longest side `size` px (default 1024). full=true for the whole window. Prefer hub_turntable to review a model.",
+     {"worker": S, "token": TOKEN, "size": {"type": "integer"}, "full": {"type": "boolean"}}, ["worker", "token"]),
+    ("hub_stop_worker", "Stop a worker (refused while another session holds a lease).", {"name": S, "token": TOKEN}, ["name"]),
+    ("hub_restart_worker", "Boot a dead/closed worker again from its newest autosave (keeps its window mode unless gui is given).",
      {"name": S, "gui": {"type": "boolean"}}, ["name"]),
-    ("hub_agent_key", "Lost your agent_key? Request a new one with a token that is still using the agent (the old key stops working). "
-                      "Without such a token, an exclusive lease reissues the key when it uses the agent.",
+    ("hub_agent_key", "New agent_key for an agent your token is still using (the old key stops working). No such token: an exclusive lease reissues it.",
      {"worker": S, "token": TOKEN, "agent": S}, ["worker", "token", "agent"]),
-    ("hub_list_archives", "Work archived when the pool recycled a worker (name, time, agents, folder).",
-     {"name": S}, []),
-    ("hub_restore_archive", "Boot a new worker with the archived work of a recycle (newest autosave + keys). "
-                            "Then: hub_lease(worker, mode=\"shared\", label=...) and pass your agent_key on your next hub_exec. "
-                            "Keeps the archived worker's window mode unless gui is given.",
+    ("hub_list_archives", "Work archived when a worker was recycled or its name reused.", {"name": S}, []),
+    ("hub_restore_archive", "Boot a new worker from an archive (newest autosave + keys); then hub_lease(mode=\"shared\", label=...) and pass your agent_key.",
      {"archive": S, "name": S, "gui": {"type": "boolean"}}, ["archive"]),
-    ("hub_kill_worker", "Hung worker: kill it and boot from autosave. Only if you hold the only live lease, or the running job is past its own timeout by more than the grace period (BLENDER_HUB_KILL_GRACE, default 60 s).",
+    ("hub_kill_worker", "Kill a hung worker and boot it from autosave (only the sole lease holder, or when its job is past its own timeout + grace).",
      {"name": S, "token": TOKEN}, ["name"]),
-    ("hub_exec", "Run bpy Python as `agent`. New objects go into Agent_<agent> (use link(ob) for bpy.data.objects.new). Set `result` to return data. Time limit: timeout (s, default 120). Warns if you touched another agent's data.",
+    ("hub_exec", "Run bpy Python as `agent`. Objects created go to Agent_<agent> (link(ob) for bpy.data.objects.new); set `result` to return data; modules from BLENDER_HUB_MODULES (e.g. K) are preloaded. timeout s (default 120). The first call that names a new agent returns agent_key: keep it.",
      {"worker": S, "token": TOKEN, "agent": S, "agent_key": KEY, "code": S, "timeout": {"type": "number"}, "note": NOTE},
      ["worker", "token", "agent", "code"]),
-    ("hub_note", "Say what you are working on (e.g. 'house 3 roof: eaves and gutters'). Shown live in the window's panel and in hub_list_workers. Call it when you start a task and whenever the task changes. Like hub_exec, the first call that names a new agent returns its agent_key: keep it.",
+    ("hub_note", "Declare the task you are working on (shown live; call at start and when it changes). Returns agent_key on the first call for a new agent.",
      {"worker": S, "token": TOKEN, "agent": S, "agent_key": KEY, "task": S}, ["worker", "token", "agent", "task"]),
-    ("hub_measure", "Minimum distance, intersection, penetration and delta between two objects (evaluated mesh, world space). Moving B by -delta_a_to_b makes B touch A (delta is None if they already penetrate). tol = sample spacing along edges.",
+    ("hub_measure", "Distance, intersection and penetration between objects a and b (world space). Move b by -delta_a_to_b to make it touch a (null if they penetrate).",
      {"worker": S, "token": TOKEN, "a": S, "b": S, "tol": {"type": "number"}}, ["worker", "token", "a", "b"]),
-    ("hub_turntable", "Review turntable: N renders around the target (from below to above). Returns the contact sheet as an image. Target: collection or objects.",
+    ("hub_turntable", "Review sheet: N renders around a collection/objects (low to high), returned as one image. views default 12, size default 256 px per view; frames=true also lists the frame files.",
      {"worker": S, "token": TOKEN, "agent": S, "agent_key": KEY, "collection": S, "objects": {"type": "array", "items": S},
-      "views": {"type": "integer"}, "size": {"type": "integer"}, "color": S, "note": NOTE}, ["worker", "token", "agent"]),
-    ("hub_export_collection", "Save your collection to a .blend (the agent's part).",
+      "views": {"type": "integer"}, "size": {"type": "integer"}, "color": S, "note": NOTE, "frames": {"type": "boolean"}},
+     ["worker", "token", "agent"]),
+    ("hub_export_collection", "Save your collection to a .blend.",
      {"worker": S, "token": TOKEN, "agent": S, "agent_key": KEY, "collection": S, "path": S, "note": NOTE},
      ["worker", "token", "agent", "collection", "path"]),
-    ("hub_merge", "Merge collections from several .blend files (requires an exclusive lease).",
+    ("hub_merge", "Append collections from .blend files (exclusive lease).",
      {"worker": S, "token": TOKEN, "paths": {"type": "array", "items": S}}, ["worker", "token", "paths"]),
-    ("hub_save", "Save the worker's .blend (a copy by default; saving without copy requires an exclusive lease).",
+    ("hub_save", "Save the worker's .blend (a copy by default; in place needs an exclusive lease).",
      {"worker": S, "token": TOKEN, "path": S, "copy": {"type": "boolean"}}, ["worker", "token", "path"]),
 ]
 _MAP = {"hub_lease": "lease", "hub_renew": "renew", "hub_release": "release", "hub_exec": "exec",
         "hub_measure": "measure", "hub_turntable": "turntable", "hub_export_collection": "export_collection",
         "hub_merge": "merge", "hub_save": "save", "hub_agent_key": "agent_key", "hub_view": "view",
         "hub_screenshot": "screenshot", "hub_note": "note"}
+
+
+def _short_status(st):
+    """What an agent needs to decide: who is there, doing what, and whether the worker is free."""
+    info = st.get("agents_info") or {}
+    agents = {}
+    for a in st.get("agents") or []:
+        i = info.get(a) or {}
+        agents[a] = {k: v for k, v in (("task", i.get("task")), ("step", i.get("step")),
+                                       ("objects", (i.get("stats") or {}).get("objects"))) if v}
+    out = {"gui": st.get("gui"), "file": os.path.basename(st["file"]) if st.get("file") else None,
+           "leases": [f"{p['label']} ({p['mode']}, {p['expires_in']}s)" for p in st.get("participants") or []],
+           "agents": agents, "busy": st.get("busy"), "idle_s": st.get("idle_s"), "rss_mb": st.get("rss_mb")}
+    bad = {k: v for k, v in (st.get("modules") or {}).items() if v != "ok"}
+    if bad:
+        out["module_errors"] = bad
+    if st.get("note"):
+        out["note"] = st["note"]
+    return {k: v for k, v in out.items() if v not in (None, [], {})}
+
+
+def _compact_lease(lease):
+    if not lease:
+        return None
+    if not lease.get("active"):
+        return {"active": False}
+    out = {"mode": lease.get("mode"), "expires_in": lease.get("expires_in")}
+    if lease.get("others"):
+        out["others"] = len(lease["others"])
+    return out
+
+
+def _round_floats(v, nd=4):
+    if isinstance(v, float):
+        return round(v, nd)
+    if isinstance(v, (list, tuple)):
+        return [_round_floats(x, nd) for x in v]
+    if isinstance(v, dict):
+        return {k: _round_floats(x, nd) for k, x in v.items()}
+    return v
 
 
 def _tool_call(hub, name, args):
@@ -885,13 +923,14 @@ def _tool_call(hub, name, args):
         return hub.kill_worker(args["name"], args.get("token")), None
     if name == "hub_list_workers":
         out = {}
+        verbose = _parse_bool(args.get("verbose", False))
         for n in hub.workers(clean=True):
             try:
-                out[n] = hub.status(n)
-                st = out[n]
+                st = hub.status(n)
                 if st.get("gui") and not st.get("participants"):
-                    st["note"] = (f"released window (no lease, idle {round((st.get('idle_s') or 0) / 60)} min): it takes a slot of the limit "
-                                  "and recycling never closes windows; ask the user before closing it (hub_stop_worker)")
+                    st["note"] = (f"released window (no lease, idle {round((st.get('idle_s') or 0) / 60)} min): ask the user "
+                                  "before closing it (hub_stop_worker)")
+                out[n] = st if verbose else _short_status(st)
             except Exception as e:
                 out[n] = {"error": f"no answer: {e}"}
         return out, None
@@ -901,7 +940,12 @@ def _tool_call(hub, name, args):
     if not r.get("ok"):
         raise RuntimeError(r.get("error"))
     res = r["result"]
-    data = {"result": res, "lease": r.get("lease")}
+    shown = res
+    if name == "hub_turntable" and isinstance(res, dict) and not _parse_bool(args.get("frames", False)):  # the image IS the answer
+        shown = {k: v for k, v in res.items() if k != "frames"}
+    elif name == "hub_measure":
+        shown = _round_floats(res)
+    data = {"result": shown, "lease": _compact_lease(r.get("lease"))}
     for k in ("violations", "notices", "agent_key", "warning", "recycled"):
         if r.get(k):
             data[k] = r[k]
@@ -942,10 +986,11 @@ def serve_mcp():
                 res = {"protocolVersion": asked if asked in SUPPORTED_PROTOCOLS else SUPPORTED_PROTOCOLS[0],
                        "capabilities": {"tools": {}},
                        "serverInfo": {"name": "blender-hub", "version": VERSION},
-                       "instructions": "Blender workers for multiple agents. Start with hub_acquire(label=<what you are doing>) (opens a Blender window the user watches live by default, with a panel showing which agents are working; gui=false for background) and keep the token; "
-                                       "always use the same `agent` name and keep the agent_key returned on its first use (resuming after the lease expires requires it). Say what you do: hub_note(task=...) when you start a task, and note=... on each hub_exec; the window's panel shows it live. "
-                                       "hub_turntable returns the turntable contact sheet; hub_measure solves fitting/contact. "
-                                       "When your task is done: hub_release, and ask the user before closing the window (hub_stop_worker)."}
+                       "instructions": "Multi-agent Blender. hub_acquire(label=...) -> keep worker+token (a window the user watches opens by default). "
+                                       "Use one `agent` name; keep the agent_key from its first call. hub_note(task=) at start, note= on each hub_exec. "
+                                       "Change only your Agent_<agent> collection; undo anything listed in `violations`; `notices` mean someone changed your objects. "
+                                       "Review with hub_turntable (one image), fit parts with hub_measure; use hub_screenshot sparingly (images cost tokens). "
+                                       "Done: hub_release, ask the user before closing the window."}
             elif method == "tools/list":
                 res = {"tools": [{"name": n, "description": d,
                                   "inputSchema": {"type": "object", "properties": p, "required": r}}
@@ -954,7 +999,7 @@ def serve_mcp():
                 p = msg.get("params") or {}
                 try:
                     data, img = _tool_call(hub, p.get("name"), p.get("arguments") or {})
-                    content = [{"type": "text", "text": json.dumps(data, ensure_ascii=False, default=str)}]
+                    content = [{"type": "text", "text": json.dumps(data, ensure_ascii=False, default=str, separators=(",", ":"))}]
                     if img:
                         content.append({"type": "image", "data": img, "mimeType": "image/png"})
                     res = {"content": content}
