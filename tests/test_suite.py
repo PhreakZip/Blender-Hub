@@ -1310,6 +1310,57 @@ bpy.app.timers.register(_edit_like_user, first_interval=8.0)
         "query": "x", "filters": {"colour": "red"}}}})
     c62 = wait(62)
     txt62 = "".join(cc.get("text", "") for cc in (c62 or {}).get("result", {}).get("content", []))
+    # live window: the window is drawn WHILE a long command runs (geometry, frame changes, renders inside the
+    # agent's own script, turntables in every engine), never from inside a render (that crashes Vulkan)
+    hooked = H.call(mw, "exec", token=mt, agent="M", agent_key=mkey,
+                    code="result = type(bpy.ops.mesh.primitive_cube_add).__name__")
+    lr_ops0 = H.status(mw).get("live_redraws") or 0
+    lops = H.call(mw, "exec", token=mt, agent="M", agent_key=mkey, code="""
+import time
+for i in range(6):
+    bpy.ops.mesh.primitive_cube_add(size=0.1, location=(i, 12, 0)); time.sleep(0.3)
+result = 1""")
+    lr_ops1 = H.status(mw).get("live_redraws") or 0
+    check("live window: the bpy.ops hook is installed and draws after operators alone (no link/refresh/frame change)",
+          H.status(mw).get("live_ops_hooked") and (hooked.get("result") or {}).get("result") == "_LiveOp"
+          and lops.get("ok") and lr_ops1 - lr_ops0 >= 4, (H.status(mw).get("live_ops_hooked"), hooked.get("result"), lr_ops0, lr_ops1))
+    lr0 = H.status(mw).get("live_redraws") or 0
+    lv = H.call(mw, "exec", token=mt, agent="M", agent_key=mkey, timeout=300, code="""
+import time
+sc = bpy.context.scene
+for i in range(15):
+    bpy.ops.mesh.primitive_cube_add(size=0.2, location=(i * 0.3, 8, 0)); time.sleep(0.03)
+cd = bpy.data.cameras.new('live_cam'); c = bpy.data.objects.new('live_cam', cd); coll.objects.link(c)
+c.location = (2, -4, 2); c.rotation_euler = (1.2, 0, 0); old_cam = sc.camera; sc.camera = c
+old_engine = sc.render.engine; sc.render.engine = 'BLENDER_EEVEE'
+for f in (1, 5, 9):
+    sc.frame_set(f); sc.render.filepath = bpy.app.tempdir + f'live_{f}.png'
+    sc.render.resolution_x = sc.render.resolution_y = 96; bpy.ops.render.render(write_still=True)
+for i in range(5):
+    refresh(); time.sleep(0.05)
+for i in range(6):  # bpy.data-style building: link() shows it
+    m = bpy.data.meshes.new(f'ld{i}'); m.from_pydata([(0, 0, 0), (1, 0, 0), (0, 1, 0)], [], [(0, 1, 2)])
+    o = bpy.data.objects.new(f'ld{i}', m); o.location = (i, 10, 0); link(o); time.sleep(0.3)
+sc.frame_start, sc.frame_end = 1, 3; sc.render.filepath = bpy.app.tempdir + 'anim_'
+bpy.ops.render.render(animation=True)  # frame changes INSIDE a render: must not draw
+bpy.ops.render.opengl(animation=False)  # viewport render
+bpy.ops.render.opengl(animation=True)
+bpy.context.view_layer.objects.active = bpy.data.objects['Cube']; bpy.ops.object.mode_set(mode='EDIT')
+import bmesh as _bm
+bm = _bm.from_edit_mesh(bpy.data.objects['Cube'].data); bm.verts.ensure_lookup_table(); bm.verts[0].co.z += 0.5  # no update_edit_mesh on purpose
+bpy.ops.mesh.select_all(action='SELECT'); time.sleep(0.3); bpy.ops.mesh.select_all(action='DESELECT')
+bpy.ops.object.mode_set(mode='OBJECT')
+sc.camera = old_cam; sc.render.engine = old_engine; sc.frame_set(1)
+result = 1""")
+    lr_mid = H.status(mw).get("live_redraws") or 0
+    lv_tt = [H.call(mw, "turntable", token=mt, agent="M", agent_key=mkey, collection="Agent_M", views=4, size=96, shading=sh)
+             for sh in ("solid", "rendered", "cycles")]
+    lr1 = H.status(mw).get("live_redraws") or 0
+    check("live window: redrawn during the agent's script (operators, link(), frame changes, after renders, refresh()) and during turntables; "
+          "no crash with animation renders, viewport (opengl) renders and an un-synced edit mesh",
+          lv.get("ok") and not (lv.get("result") or {}).get("error") and all(x.get("ok") for x in lv_tt)
+          and lr_mid - lr0 >= 8 and lr1 - lr_mid >= 6 and H.status(mw).get("pid"),
+          (lv.get("error") or (lv.get("result") or {}).get("error"), [x.get("error") for x in lv_tt], lr0, lr_mid, lr1))
     # the interpreter the installer registers (pythonw.exe: no console window) really serves MCP over stdio;
     # a pythonw.exe that does not answer falls back to python.exe
     import install as inst

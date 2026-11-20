@@ -196,6 +196,8 @@ Window mode is the default for the MCP tools (`gui=false` or `BLENDER_HUB_GUI_DE
 - autosave ~5 s after any change, including your own manual edits (not during animation playback); 20 autosaves kept;
 - closing with the window's X asks "Save?" as usual; pool recycling never closes a window.
 
+**Live while a command runs.** Blender only redraws between commands, so a long `hub_exec` or a turntable used to show nothing until it ended. The worker now redraws the 3D view during the command, only at safe points: after each top-level `bpy.ops` call returns (renders included), on the agent's own frame changes, when `link(ob)` adds an object, and after every turntable view (the panel shows `turntable 5/12`). Never inside an operator, a render, bake or composite job, a file load or undo, or outside Object Mode (drawing there can crash Blender: drawing from inside a render crashes the Vulkan backend). Throttled to at least `BLENDER_HUB_LIVE_EVERY` s apart (0.25; `0` turns it off) and to about a quarter of the time (the gap grows with the draw's own cost on big scenes); turntable draws are skipped while a viewport is in Material Preview / Rendered (it would start its own GPU render). Scripts that only set properties can call `refresh()` in `hub_exec`. Redraw time counts against the `hub_exec` timeout. This costs no tokens: nothing is sent back to the agent.
+
 In window mode **you own everything**: your manual edits are not reported as violations.
 
 **Live panel.** Every window shows, at the bottom-left of the 3D viewport (like Blender's own statistics overlay), how many agents are working in that Blender and who they are, updated every second:
@@ -217,7 +219,7 @@ Point `BLENDER_HUB_MODULES` at Python files and every worker loads them into the
 ```powershell
 powershell -ExecutionPolicy Bypass -File install.ps1 -ClaudeDesktop -Module "K=C:\path\to\my_kit.py" -Test -Yes
 ```
-- Format of the env var: `NAME=PATH` entries separated by `;` (`NAME` defaults to the file stem; ASCII letters, digits and `_`; `bpy`, `bmesh`, `mathutils`, `np`, `math`, `agent`, `coll`, `link`, `result`, `args` are reserved). Installer: repeat `--module NAME=PATH` for `install.py`, or give a comma list to `install.ps1 -Module "K=a.py","L=b.py"`. Each file is executed into its own dict, exactly like `K = {}; exec(open(path).read(), K)`, so code written for that pattern works unchanged: `K["Builder"](...)`.
+- Format of the env var: `NAME=PATH` entries separated by `;` (`NAME` defaults to the file stem; ASCII letters, digits and `_`; `bpy`, `bmesh`, `mathutils`, `np`, `math`, `agent`, `coll`, `link`, `result`, `args`, `refresh` are reserved). Installer: repeat `--module NAME=PATH` for `install.py`, or give a comma list to `install.ps1 -Module "K=a.py","L=b.py"`. Each file is executed into its own dict, exactly like `K = {}; exec(open(path).read(), K)`, so code written for that pattern works unchanged: `K["Builder"](...)`.
 - A changed file is reloaded on the next `hub_exec` (loading has a 60 s watchdog); a broken file, an invalid or a reserved name is reported in `hub_list_workers` (`modules`) and never blocks `hub_exec`.
 - Every agent gets **its own instance** of each module (executed once per agent and file version): `K` is the kit functions' own globals, so `K["SCALE"] = 2; K["build"]()` works as in the plain pattern, and nothing an agent sets in its `K` reaches other agents. Modules must not change the scene when they are loaded.
 
@@ -237,6 +239,7 @@ Environment variables (set them in the MCP entry's `env`):
 | `BLENDER_HUB_MIN_FREE_MB` | `1500` | do not start a worker below this free RAM |
 | `BLENDER_HUB_IDLE` | `1800` | background worker exits after N s with no lease and no command |
 | `BLENDER_HUB_AUTOSAVE` | `300` | background autosave interval (s); window mode saves ~5 s after changes |
+| `BLENDER_HUB_LIVE_EVERY` | `0.25` | window mode: seconds between redraws while a command runs; `0` = only between commands |
 | `BLENDER_HUB_KILL_GRACE` | `60` | `hub_kill_worker` by time: seconds past the job's own deadline |
 | `SKETCHFAB_API_KEY` | — | `hub_assets` import from Sketchfab (search works without it) |
 | `POLYPIZZA_API_KEY` | — | `hub_assets` search and import from Poly Pizza |
@@ -251,7 +254,7 @@ Environment variables (set them in the MCP entry's `env`):
 ```powershell
 python tests\test_suite.py --max-workers 10 --jobs 20
 ```
-Uses its own state folder and ports **9981+**, so it never touches real workers or your Blender. It starts up to 10 Blenders (needs ~3 GB free RAM), briefly opens a few visible Blender windows (window-mode and MCP-default checks), and takes about 4 minutes. 160 checks: pool, identity, leases, 18 kinds of cross-agent changes, false-alarm cases, watchdog, kill, autosave/restore, measure accuracy, turntable (solid, x-ray, wireframe, EEVEE, Cycles, scene camera, timeline), image capture, scene facts, asset libraries (skipped offline), window mode, MCP stdio protocol. Results go to `tests/results/`.
+Uses its own state folder and ports **9981+**, so it never touches real workers or your Blender. It starts up to 10 Blenders (needs ~3 GB free RAM), briefly opens a few visible Blender windows (window-mode and MCP-default checks), and takes about 4 minutes. 163 checks: pool, identity, leases, 18 kinds of cross-agent changes, false-alarm cases, watchdog, kill, autosave/restore, measure accuracy, turntable (solid, x-ray, wireframe, EEVEE, Cycles, scene camera, timeline), image capture, scene facts, asset libraries (skipped offline), window mode, MCP stdio protocol. Results go to `tests/results/`.
 
 ## Token budget
 Images cost tokens by pixel count and stay in the conversation, so the hub keeps them small; text replies are compact JSON. Measured with `python tests/token_budget.py` (a typical modeling session: 1 acquire, 1 note, 25 exec, 4 turntables, 4 screenshots, 2 status calls; each reply counted once — images stay in the conversation, so their real cumulative cost is higher, which makes the image savings matter more):

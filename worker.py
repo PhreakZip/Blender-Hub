@@ -54,7 +54,7 @@ try:
 except Exception:
     np = None
 
-VERSION = "0.13.1"
+VERSION = "0.14.0"
 LEASE_TTL_DEFAULT = 900.0
 LEASE_TTL_MAX = 3600.0
 NET_CMDS = {"ping", "status", "check_token"}   # answered outside the queue, without bpy
@@ -681,7 +681,7 @@ def _watchdog():
     while True:
         time.sleep(0.2)
         with EXEC_GUARD:
-            if (EXEC_STATE["active"] and EXEC_STATE["gen"] == EXEC_STATE["armed_gen"]
+            if (EXEC_STATE["active"] and EXEC_STATE["gen"] == EXEC_STATE["armed_gen"] and not LIVE["in"]
                     and time.perf_counter() > EXEC_STATE["deadline"] and _in_agent_code()):
                 _async_raise(_Timeout)
                 EXEC_STATE["deadline"] = time.perf_counter() + 1.0  # resend if the code swallows it
@@ -788,6 +788,113 @@ def _redraw():
         for win in bpy.context.window_manager.windows:
             for area in win.screen.areas:
                 area.tag_redraw()
+
+
+LIVE = {"last": 0.0, "cost": 0.0, "count": 0, "progress": None, "in": False, "rendering": False,
+        "loading": False, "op_depth": 0, "skip_turntable": False}
+
+
+def _live_every():
+    try:
+        return max(float(os.environ.get("BLENDER_HUB_LIVE_EVERY", "0.25")), 0.0)
+    except ValueError:
+        return 0.25
+
+
+LIVE_EVERY = _live_every()  # s between redraws while a command runs; 0 = off
+
+
+def _live_safe():
+    """Only at safe points: a command is running, no operator is executing (op_depth 0), no render / bake /
+    composite job, no file load or undo in progress, and Object Mode (drawing a stale edit/sculpt mesh can crash)."""
+    if bpy.app.background or LIVE_EVERY <= 0 or not STATUS.get("busy"):
+        return False
+    if LIVE["in"] or LIVE["rendering"] or LIVE["loading"] or LIVE["op_depth"] > 0 or LIVE["skip_turntable"]:
+        return False
+    with contextlib.suppress(Exception):
+        for job in ("RENDER", "RENDER_PREVIEW", "OBJECT_BAKE", "COMPOSITE", "SEQ_BUILD_PROXY"):
+            if bpy.app.is_job_running(job):
+                return False
+    try:
+        return bpy.context.mode == "OBJECT"
+    except Exception:
+        return False
+
+
+def _live_refresh(force=False):
+    """Window mode, WHILE a command runs (the main thread is busy, so Blender would not redraw until it ends):
+    draw the 3D view now. Throttled: at least LIVE_EVERY s apart, and never more than ~25% of the time
+    (interval >= 4x the last draw's cost); force (refresh(), turntable frames) only skips LIVE_EVERY.
+    Called after each top-level bpy.ops call, on frame changes, after turntable frames, from link() and
+    refresh(). Costs no tokens: nothing goes back to the agent."""
+    if not _live_safe():
+        return
+    now = time.time()
+    floor = max(4.0 * LIVE["cost"], 1.0 / 30.0)
+    if now - LIVE["last"] < (floor if force else max(LIVE_EVERY, floor)):
+        return
+    # context.mode only reflects the active object: any object left in Edit/Sculpt mode keeps a stale draw mesh
+    with contextlib.suppress(Exception):
+        if any(o.mode != "OBJECT" for o in bpy.context.view_layer.objects):
+            return
+    t0 = time.perf_counter()
+    try:
+        LIVE["in"] = True  # drawing may evaluate the depsgraph, which calls the handlers again
+        wm = bpy.context.window_manager
+        if not wm.windows:
+            return
+        win = wm.windows[0]
+        area, region = _view3d(win)
+        if area is None or region is None:
+            return
+        area.tag_redraw()  # only the 3D view (with the live panel), not the outliner/properties of a big scene
+        with bpy.context.temp_override(window=win, area=area, region=region):
+            bpy.ops.wm.redraw_timer(type="DRAW_SWAP", iterations=1)
+        LIVE["count"] += 1
+    except Exception:
+        pass
+    finally:
+        LIVE["cost"] = time.perf_counter() - t0
+        LIVE["last"] = time.time()
+        LIVE["in"] = False
+
+
+class _LiveOp:
+    """Wraps a bpy.ops callable: counts nesting, and after a TOP-LEVEL operator returns (a safe point: nothing
+    is being evaluated or rendered) lets the live window catch up. Everything else is delegated untouched."""
+    __slots__ = ("_op",)
+
+    def __init__(self, op):
+        self._op = op
+
+    def __call__(self, *a, **k):
+        LIVE["op_depth"] += 1
+        try:
+            return self._op(*a, **k)
+        finally:
+            LIVE["op_depth"] -= 1
+            if LIVE["op_depth"] == 0 and STATUS.get("busy"):
+                _live_refresh()
+
+    def __getattr__(self, name):
+        return getattr(self._op, name)
+
+    def __repr__(self):
+        return repr(self._op)
+
+
+def _install_live_ops():
+    """bpy.ops.<module>.<op> objects come from bpy.ops._bpy_ops_submodule__getattr__ (5.x): wrap what it returns."""
+    import bpy.ops as _ops
+    orig = getattr(_ops, "_bpy_ops_submodule__getattr__", None)
+    if orig is None or getattr(orig, "_hub_live", False):
+        return False
+
+    def wrapped(module, func):
+        return _LiveOp(orig(module, func))
+    wrapped._hub_live = True
+    _ops._bpy_ops_submodule__getattr__ = wrapped
+    return True
 
 
 def _ensure_object_mode():
@@ -959,7 +1066,7 @@ def _module_specs():
 
 
 MODULE_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
-RESERVED_NAMES = {"bpy", "bmesh", "mathutils", "np", "math", "agent", "coll", "link", "result", "args"}
+RESERVED_NAMES = {"bpy", "bmesh", "mathutils", "np", "math", "agent", "coll", "link", "result", "args", "refresh"}
 
 
 AGENT_MODS = {}  # (module name, agent) -> (mtime, globals dict): every agent gets its own instance
@@ -1040,11 +1147,13 @@ def cmd_exec(req):
     def link(ob):
         if ob.name not in coll.objects:
             coll.objects.link(ob)
+        _live_refresh()  # bpy.data-style building (no bpy.ops) shows up live too
         return ob
 
     mods = {n: inst[1] for (n, a), inst in AGENT_MODS.items() if a == agent and n in MODULES and MODULES[n].get("code")}
     ns = {**mods, "bpy": bpy, "bmesh": bmesh, "mathutils": mathutils, "np": np, "math": math,
-          "agent": agent, "coll": coll, "link": link, "result": None}
+          "agent": agent, "coll": coll, "link": link, "result": None,
+          "refresh": lambda: _live_refresh(force=True)}  # long scripts: show the work in the window now
     buf = io.StringIO()
     err = None
     timeout = min(max(float(req.get("timeout", 120)), 1.0), 1800.0)
@@ -1664,7 +1773,12 @@ def _turntable_render(req, obs, n, size, shading="solid", timeline=None, scene_c
             cam_data.clip_start = max(dist - radius * 2, 1e-3) * 0.5
             cam_data.clip_end = dist + radius * 4
         el_lo, el_hi = req.get("elev", (-15.0, 60.0))
+        with contextlib.suppress(Exception):  # a Material Preview / Rendered viewport would start its own GPU render
+            LIVE["skip_turntable"] = any(sp.type == "VIEW_3D" and sp.shading.type in ("MATERIAL", "RENDERED")
+                                         for w_ in bpy.context.window_manager.windows for a_ in w_.screen.areas
+                                         for sp in a_.spaces)
         for i in range(n):
+            LIVE["progress"] = f"{'timeline' if timeline else 'turntable'} {i + 1}/{n}"
             if timeline:
                 sc.frame_set(timeline[i])
                 if shading == "wireframe":  # the copies are meshes of one pose: rebuild them for this frame
@@ -1691,6 +1805,8 @@ def _turntable_render(req, obs, n, size, shading="solid", timeline=None, scene_c
                     raise RuntimeError(f"shading='cycles' failed: {e}") from e
                 raise
             frames.append(path)
+            LIVE["rendering"] = False  # render.render returned: safe to draw
+            _live_refresh(force=True)  # (_live_safe skips it while a viewport renders on its own)
         if np is not None and req.get("sheet", True):
             cols = min(int(req.get("cols", 4)), n)
             rows = math.ceil(n / cols)
@@ -1724,6 +1840,7 @@ def _turntable_render(req, obs, n, size, shading="solid", timeline=None, scene_c
         for obj, attr, val in reversed(saved):  # field by field, in reverse order
             with contextlib.suppress(Exception):
                 setattr(obj, attr, val)
+        LIVE["progress"] = None
         if timeline or sc.frame_current != frame0 or sc.frame_subframe != subframe0:
             with contextlib.suppress(Exception):
                 sc.frame_set(frame0, subframe=subframe0)
@@ -2536,7 +2653,12 @@ def dispatch(req):
     # job deadline, exposed in status: a timeout kill only applies after it (+ margin)
     limit = {"exec": min(max(float(req.get("timeout", 120)), 1.0), 1800.0), "turntable": 1800.0}.get(cmd, 600.0)
     STATUS["busy_deadline"] = time.time() + limit
-    result = fn(req)
+    try:
+        result = fn(req)
+    finally:
+        # a render/load that failed before its *_complete/_post handler must not block live redraws
+        LIVE.update(rendering=False, loading=False, op_depth=0, skip_turntable=False)
+        LIVE["in"] = False
     if own_before is not None:  # seen by the hub itself, even if the agent never says what it does
         with contextlib.suppress(Exception):
             _record_change(req["_agent"], own_before)
@@ -2600,6 +2722,7 @@ def _status():
             "agents_info": _agents_info_view(),
             "overlay": _overlay_lines(),
             "commands": STATUS["commands"], "objects": STATUS["objects"], "autosave": STATUS["autosave_path"],
+            "live_redraws": LIVE["count"], "live_ops_hooked": bool(LIVE.get("ops_hooked")),
             "idle_s": round(time.time() - STATUS["last_activity"], 1), "uptime_s": round(time.time() - STATUS["started"], 1)}
 
 
@@ -2776,7 +2899,8 @@ def _overlay_lines():
         p = parts.get(t, {})
         lease = f"'{p.get('label', '?')}' {p.get('mode', '')}".strip()
         if busy_tok == t and busy_cmd and (busy_agent in (None, a)):
-            state, kind = f"running {busy_cmd} {_ago(busy_since or now)}", "busy"
+            prog = LIVE.get("progress")
+            state, kind = f"running {prog or busy_cmd} {_ago(busy_since or now)}", "busy"
         elif a in last and now - last[a] < 60:
             state, kind = f"active, last command {_ago(last[a])} ago", "active"
         else:
@@ -2868,6 +2992,40 @@ def _gui_start(sock):
                     STATUS["dirty"] = True
                     return
         bpy.app.handlers.depsgraph_update_post.append(_user_edit)
+
+        @bpy.app.handlers.persistent
+        def _live(*_a):  # agent work shows up in the window while the command is still running
+            _live_refresh()
+
+        @bpy.app.handlers.persistent
+        def _render_on(*_a):
+            LIVE["rendering"] = True
+
+        @bpy.app.handlers.persistent
+        def _render_off(*_a):
+            LIVE["rendering"] = False
+        @bpy.app.handlers.persistent
+        def _load_on(*_a):
+            LIVE["loading"] = True
+
+        @bpy.app.handlers.persistent
+        def _load_off(*_a):
+            LIVE["loading"] = False
+        # first in line: handlers of other add-ons that run before ours must already see the flag
+        bpy.app.handlers.render_init.insert(0, _render_on)
+        bpy.app.handlers.render_pre.insert(0, _render_on)
+        for h in (bpy.app.handlers.render_complete, bpy.app.handlers.render_cancel):
+            h.append(_render_off)
+        for name in ("load_pre", "undo_pre", "redo_pre"):
+            getattr(bpy.app.handlers, name).insert(0, _load_on)
+        for name in ("load_post", "load_post_fail", "undo_post", "redo_post"):
+            if hasattr(bpy.app.handlers, name):
+                getattr(bpy.app.handlers, name).append(_load_off)
+        # depsgraph updates inside an operator are not safe points (_live_safe checks op_depth); frame changes
+        # from the agent's own frame_set are
+        for h in (bpy.app.handlers.depsgraph_update_post, bpy.app.handlers.frame_change_post):
+            h.append(_live)
+        LIVE["ops_hooked"] = _install_live_ops()
         if OVERLAY:  # live panel: worker, how many / which agents are working (bottom-left of every 3D view)
             bpy.types.SpaceView3D.draw_handler_add(_draw_overlay, (), "WINDOW", "POST_PIXEL")
         bpy.app.timers.register(tick, first_interval=0.05, persistent=True)

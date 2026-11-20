@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.14.0 — 2026-11-20
+- Live window during long commands: the worker redraws the 3D view while a command runs, at safe points only — after each top-level `bpy.ops` call returns (renders included), on the agent's frame changes, on `link(ob)` and after every turntable view (the panel shows `turntable 5/12`) — so the user sees the model being built and reviewed instead of a frozen window. Never inside an operator, render/bake/composite job, file load or undo, or outside Object Mode (drawing inside the render callback crashed the Vulkan backend). Throttled (`BLENDER_HUB_LIVE_EVERY`, default 0.25 s, plus an adaptive gap on heavy scenes); the watchdog never interrupts a draw. `refresh()` in `hub_exec` for property-only loops. No tokens: nothing goes back to the agent.
+- 163-check suite.
+
 ## 0.13.1 — 2026-11-20
 - No more empty "python.exe" console window: the installer registers the hub with `pythonw.exe` (same stdio MCP, no console) after checking that it really answers over stdio (else `python.exe` with a warning). Every console child the hub starts runs with `CREATE_NO_WINDOW`: `taskkill`, and Blender itself in both modes (blender.exe is a console program; the Blender window is unaffected), so a window worker no longer gets an empty console either. Existing installs: change `python.exe` to `pythonw.exe` in the MCP entry, or run the installer again.
 

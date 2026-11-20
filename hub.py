@@ -24,7 +24,7 @@ import subprocess
 import threading
 import contextlib
 
-VERSION = "0.13.1"
+VERSION = "0.14.0"
 # the hub runs without a console (pythonw.exe): console children like taskkill would each flash a window
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -839,7 +839,7 @@ TOOLS = [
      {"archive": S, "name": S, "gui": {"type": "boolean"}}, ["archive"]),
     ("hub_kill_worker", "Kill a hung worker and boot it from autosave (only the sole lease holder, or when its job is past its own timeout + grace).",
      {"name": S, "token": TOKEN}, ["name"]),
-    ("hub_exec", "Run bpy Python as `agent`: `code`, or `script` (path to a saved .py; edit the file between runs instead of re-sending code) with optional `args` (dict, available as `args`). Objects created go to Agent_<agent> (link(ob) for bpy.data.objects.new); set `result` to return data; modules from BLENDER_HUB_MODULES (e.g. K) are preloaded. timeout s (default 120). The first call that names a new agent returns agent_key: keep it.",
+    ("hub_exec", "Run bpy Python as `agent`: `code`, or `script` (path to a saved .py; edit the file between runs instead of re-sending code) with optional `args` (dict, available as `args`). Objects created go to Agent_<agent> (link(ob) for bpy.data.objects.new); set `result` to return data; refresh() redraws the window mid-script; modules from BLENDER_HUB_MODULES (e.g. K) are preloaded. timeout s (default 120). The first call that names a new agent returns agent_key: keep it.",
      {"worker": S, "token": TOKEN, "agent": S, "agent_key": KEY, "code": S, "script": S, "args": {"type": "object"},
       "timeout": {"type": "number"}, "note": NOTE},
      ["worker", "token", "agent"]),
