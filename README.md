@@ -249,14 +249,29 @@ Uses its own state folder and ports **9981+**, so it never touches real workers 
 ## Token budget
 Images cost tokens by pixel count and stay in the conversation, so the hub keeps them small; text replies are compact JSON. Measured with `python tests/token_budget.py` (a typical modeling session: 1 acquire, 1 note, 25 exec, 4 turntables, 4 screenshots, 2 status calls; each reply counted once — images stay in the conversation, so their real cumulative cost is higher, which makes the image savings matter more):
 
-| | 0.9.0 | 0.10.0 |
-|---|---|---|
-| `hub_screenshot` (viewport only, ≤ 1024 px instead of the 1920×1009 window) | ~2,650 | ~850 |
-| `hub_turntable` (no list of frame paths in the reply) | ~1,480 | ~1,100 |
-| `hub_list_workers` (short by default) | ~300 per worker | ~50 per worker |
-| `hub_exec` reply | ~40 | ~22 |
-| tool definitions + instructions | ~3,100 | ~2,560 |
-| **typical session** | **~21,300** | **~11,100** |
+| | 0.9.0 | 0.10.0 | 0.11.0 |
+|---|---|---|---|
+| `hub_screenshot` (viewport only, ≤ 1024 px instead of the 1920×1009 window) | ~2,650 | ~850 | ~830 |
+| `hub_turntable` (no list of frame paths in the reply) | ~1,480 | ~1,100 | ~1,090 (repeat of an unchanged model: ~70) |
+| `hub_list_workers` (short by default) | ~300 per worker | ~50 per worker | ~50 per worker |
+| `hub_exec` reply | ~40 | ~22 | ~10 |
+| tool definitions + instructions | ~3,100 | ~2,560 | ~2,750 |
+| **typical session** | **~21,300** | **~11,100** | **~10,900 (−49% vs 0.9.0)** |
+
+### Compared with the standard Blender MCP addon
+The same session, measured the same way against the standard addon (`mcp-for-blender` 2.3.1, installed as `blender-mcp`, with its Blender addon) on a throwaway Blender 5.3 window. Call mapping: `execute_blender_code` for `hub_exec`, `look(mode="angles")` for `hub_turntable` (at most 6 views per image, so 12 angles take two images), `look(max_size=...)` for `hub_screenshot`, and `get_scene_info` for `hub_list_workers` (different calls with different content, used as the status check of each). The hub session also includes `hub_acquire`, `hub_note` and `hub_release` (~67 tokens), which have no addon counterpart.
+
+| | Standard addon | Blender Hub 0.11.0 | Difference |
+|---|---|---|---|
+| tool definitions + instructions (sent with every request) | ~6,070 (10 tools) | ~2,750 (21 tools) | **−55%** |
+| review in 12 angles | ~1,150 (2 images of 6) | ~1,090 (1 sheet) | −5% |
+| repeated review of an unchanged model | ~1,150 | ~70 | **−94%** |
+| viewport capture at 1024 px | ~810 | ~830 | +3% |
+| `exec` reply | ~8 | ~10 | +2 tokens |
+| **typical session, same quality** (12 angles, 1024 px captures) | **~14,300** | **~10,900** | **−24%** |
+| typical session, addon at its defaults (4 angles, 768 px captures; the hub still shows 12 angles at 1024 px) | ~11,700 | ~10,900 | −7%, with the hub showing more |
+
+Not in the session totals: repeated reviews (every review is counted as a new image there), the code an agent no longer re-sends when using `script=`, and parallel agents (the addon talks to one Blender on one port; the hub runs up to 10 workers by default, configurable with `BLENDER_HUB_MAX_WORKERS`).
 
 0.11.0 adds savings that do not touch quality (same views, same resolution, same review):
 - **Repeated turntable of an unchanged model**: ~1,090 → ~70 tokens. Reuse happens only when every target is a **self-contained mesh** (no particle hair, no Geometry Nodes, no modifier pointing at another object or collection) and nothing it draws changed: its evaluated mesh and attributes, every modifier setting (render-only ones included), world matrix, mesh and object-linked materials with all their nodes, and the scene display settings. Anything else — curves, text, metaballs, booleans with outside cutters, `color="TEXTURE"`, `isolate=false`, a custom `tag`/`out_dir` — always renders. `force=true` always renders (use it if the earlier image is no longer in your context).
