@@ -9,11 +9,12 @@ Built for Claude (Desktop / Code) and any MCP client. Windows only. No dependenc
 | Agents in parallel | 1 Blender, one command at a time | Pool of up to 10 Blenders (configurable), one per agent |
 | Two agents, one scene | They can overwrite each other silently | Each agent owns a collection; touching someone else's work is reported to both |
 | Identity | None | Lease token per session + `agent_key` per agent |
-| Review renders | One viewport capture per call | `hub_turntable`: 12 views + one contact sheet in ~1 s; `shading="rendered"` for an EEVEE sheet (materials, emissive, light) at the same token cost |
+| Review renders | One viewport capture per call | `hub_turntable`: 12 views + one contact sheet in ~1 s, in solid, x-ray, wireframe, EEVEE or Cycles, from the orbit or the scene camera, or as an animation strip, all at the same token cost |
 | Fitting parts together | Guess coordinates | `hub_measure`: distance, intersection, penetration and the exact move to make them touch |
 | Crash / forgotten agent | Work lost | Rotating autosaves, archives, `hub_restart_worker`, `hub_restore_archive` |
 | Watch live | Yes (one window) | Yes, by default: one window per session, with `hub_view` / `hub_screenshot` and a live panel of who is working |
 | Shared helper code | Pasted into every call | `BLENDER_HUB_MODULES`: your kit is preloaded in every `hub_exec` and reloaded when the file changes |
+| Scene facts and asset libraries | Yes | Yes: `hub_scene` (text) and `hub_assets` (Poly Haven, Sketchfab, Poly Pizza), imports owned by the agent |
 
 ---
 
@@ -168,9 +169,11 @@ For fully independent tasks (10 different assets), give each agent its own **exc
 | `hub_exec` | Run Python in Blender as `agent` (required): `code`, or `script` (absolute path to a saved `.py`, BOM ok, `__file__` set; not both) with `args` (a dict, available as `args`). Also `timeout`, `agent_key`, `note` (what this step does, shown live). |
 | `hub_note` | Declare the task you are working on (`task`); shown live in the window's panel and in `hub_list_workers`. |
 | `hub_measure` | Min distance, intersecting faces, penetration (ray-parity), manifold flags and `delta_a_to_b` between two objects. `tol` = edge sample spacing. |
-| `hub_turntable` | N renders around the target + a contact sheet returned as an image. `agent` required; `views` 1–48 (default 12), `size` 64–1024 (default 256); `shading` `solid` (Workbench, default: form and color) or `rendered` (EEVEE, 16 samples: materials, emissive, light; `color` is ignored; with `isolate` (default) the hub uses its own fixed world and two sun lights, otherwise the scene's, or the hub's if the scene has none). Needs a Blender that can use the GPU; if EEVEE fails, the error says to use `solid`. During any turntable the compositor, sequencer, render border, Freestyle, motion blur, simplify, background scene, view-layer material override, look, exposure and gamma are neutralised and then restored, so the sheet shows the model itself. An identical turntable of an unchanged model answers `unchanged` without an image; in rendered mode, materials that read images or other objects always re-render; `force=true` renders anyway. |
+| `hub_turntable` | N renders around the target + a contact sheet returned as an image. `agent` required; `views` 1–48 (default 12), `size` 64–1024 (default 256). `shading`: `solid` (Workbench, default: form and color), `xray` (see-through), `wireframe` (wire copies of the evaluated meshes; the originals are only hidden from the render), `rendered` (EEVEE, 16 samples) or `cycles` (16 samples + denoise): the last two show materials, emissive and light, ignore `color`, and with `isolate` (default) use the hub's own fixed world and two sun lights, otherwise the scene's, or the hub's if the scene has none. EEVEE needs a Blender that can use the GPU; if it fails, the error says to use `solid`. `camera="scene"`: render through the scene camera (tiles keep the render aspect). `timeline`: a count (2–48, spread over the frame range) or a list of frames: an animation strip, one fixed three-quarter view framing the whole motion (or the scene camera); the current frame (and subframe) and any unkeyed edits to animated properties (custom properties and NLA included) are restored after; a scene with unbaked simulations (rigid body, cloth, soft body, particles, fluid, Geometry Nodes simulation) is refused, since jumping frames resets their caches, unless `force=true` (the reply then warns). During any turntable the compositor, sequencer, render border, Freestyle, motion blur, simplify, background scene, view-layer material override, look, exposure and gamma are neutralised and then restored, so the sheet shows the model itself. An identical turntable of an unchanged model answers `unchanged` without an image; in rendered/cycles mode, materials that read images or other objects always re-render; the scene camera and timelines never reuse; `force=true` renders anyway. |
+| `hub_scene` | Scene facts as text (no image): a header (object counts, active, selection, mode), optional `settings` line (file, engine, frame range, resolution, camera, HDRI, unit scale), then one line per object with `fields`: location, size (world bbox), ground (on ground / floating / below by), rotation, scale, parent, children, hidden, details (faces, bones, light power), materials, modifiers, animation, topology (quads, tris, ngons, non-manifold, boundary, loose, poles), weights (vertices no deform bone moves, deform bones without a group). `query` filters names, `root` lists a hierarchy, `limit` 20. |
+| `hub_assets` | `action="search"`: `query` in `source` `polyhaven` (CC0 HDRIs, textures, models; ranked by name, tags and categories), `sketchfab` (downloadable models) or `polypizza` (low poly); `filters`: `type` (hdris/textures/models), `category` and `min_size_m` for Poly Haven; `category`, `licence` (`CC0`/`CC-BY`) and `animated` for Sketchfab and Poly Pizza; results capped at 24; `previews=N` (max 6) adds one thumbnail image. `action="import"` with `asset_id` (Poly Haven's `type` is looked up when omitted): models land in `Agent_<agent>` with their source, author and license as `asset_*` custom properties, scaled to `target_size` metres (required for Sketchfab); Poly Haven textures build a PBR material (`apply_to`: your objects); HDRIs set the world (exclusive lease). `resolution` 1k–8k (default 2k). Downloads (https only; API keys never follow a redirect to another host; zips checked for paths leaving their folder and for size) are cached in the state folder and happen outside Blender's main thread, so the window and other agents never wait on the network. Selection, active object and active collection are restored after an import. Sketchfab import needs `SKETCHFAB_API_KEY`, Poly Pizza needs `POLYPIZZA_API_KEY` (in the MCP entry's env). |
 | `hub_view` | Window mode: frame the viewport on a collection/objects (keeps the user's selection). |
-| `hub_screenshot` | Window mode: what the user sees — by default only the 3D viewport, longest side `size` px (1024); `full=true` for the whole window. Returned as an image. |
+| `hub_screenshot` | Window mode: what the user sees — by default only the 3D viewport, longest side `size` px (1024); `full=true` for the whole window; `shading` (`solid`/`material`/`rendered`/`wireframe`) for this capture only (the user's shading is restored). `image`: `"Render Result"`, an image in the file or an image file path instead of the screen (works on background workers too). Returned as an image. |
 | `hub_export_collection` | Save your collection to a `.blend`. `agent` required. |
 | `hub_merge` | Append collections from several `.blend` files (exclusive lease). |
 | `hub_save` | Save the worker's file (copy by default; in-place needs exclusive). |
@@ -233,6 +236,8 @@ Environment variables (set them in the MCP entry's `env`):
 | `BLENDER_HUB_IDLE` | `1800` | background worker exits after N s with no lease and no command |
 | `BLENDER_HUB_AUTOSAVE` | `300` | background autosave interval (s); window mode saves ~5 s after changes |
 | `BLENDER_HUB_KILL_GRACE` | `60` | `hub_kill_worker` by time: seconds past the job's own deadline |
+| `SKETCHFAB_API_KEY` | — | `hub_assets` import from Sketchfab (search works without it) |
+| `POLYPIZZA_API_KEY` | — | `hub_assets` search and import from Poly Pizza |
 
 ## Recovery
 - **Worker crashed or exited idle:** `hub_restart_worker(name)` loads its newest autosave and keeps the agent keys.
@@ -244,32 +249,34 @@ Environment variables (set them in the MCP entry's `env`):
 ```powershell
 python tests\test_suite.py --max-workers 10 --jobs 20
 ```
-Uses its own state folder and ports **9981+**, so it never touches real workers or your Blender. It starts up to 10 Blenders (needs ~3 GB free RAM), briefly opens a few visible Blender windows (window-mode and MCP-default checks), and takes about 4 minutes. 147 checks: pool, identity, leases, 18 kinds of cross-agent changes, false-alarm cases, watchdog, kill, autosave/restore, measure accuracy, turntable (solid and rendered), window mode, MCP stdio protocol. Results go to `tests/results/`.
+Uses its own state folder and ports **9981+**, so it never touches real workers or your Blender. It starts up to 10 Blenders (needs ~3 GB free RAM), briefly opens a few visible Blender windows (window-mode and MCP-default checks), and takes about 4 minutes. 160 checks: pool, identity, leases, 18 kinds of cross-agent changes, false-alarm cases, watchdog, kill, autosave/restore, measure accuracy, turntable (solid, x-ray, wireframe, EEVEE, Cycles, scene camera, timeline), image capture, scene facts, asset libraries (skipped offline), window mode, MCP stdio protocol. Results go to `tests/results/`.
 
 ## Token budget
 Images cost tokens by pixel count and stay in the conversation, so the hub keeps them small; text replies are compact JSON. Measured with `python tests/token_budget.py` (a typical modeling session: 1 acquire, 1 note, 25 exec, 4 turntables, 4 screenshots, 2 status calls; each reply counted once — images stay in the conversation, so their real cumulative cost is higher, which makes the image savings matter more):
 
-| | 0.9.0 | 0.10.0 | 0.11.0 |
+| | 0.9.0 | 0.10.0 | 0.11.0 → 0.13.0 |
 |---|---|---|---|
 | `hub_screenshot` (viewport only, ≤ 1024 px instead of the 1920×1009 window) | ~2,650 | ~850 | ~830 |
 | `hub_turntable` (no list of frame paths in the reply) | ~1,480 | ~1,100 | ~1,090 (repeat of an unchanged model: ~70; 0.12.0 `rendered`: ~1,100, same as solid) |
 | `hub_list_workers` (short by default) | ~300 per worker | ~50 per worker | ~50 per worker |
 | `hub_exec` reply | ~40 | ~22 | ~10 |
-| tool definitions + instructions | ~3,100 | ~2,560 | ~2,750 |
-| **typical session** | **~21,300** | **~11,100** | **~10,900 (−49% vs 0.9.0)** |
+| tool definitions + instructions | ~3,100 | ~2,560 | ~2,750 → ~3,130 (23 tools) |
+| **typical session** | **~21,300** | **~11,100** | **~10,900 → ~11,260 (−47% vs 0.9.0)** |
 
 ### Compared with the standard Blender MCP addon
 The same session, measured the same way against the standard addon (`mcp-for-blender` 2.3.1, installed as `blender-mcp`, with its Blender addon) on a throwaway Blender 5.3 window. Call mapping: `execute_blender_code` for `hub_exec`, `look(mode="angles")` for `hub_turntable` (at most 6 views per image, so 12 angles take two images), `look(max_size=...)` for `hub_screenshot`, and `get_scene_info` for `hub_list_workers` (different calls with different content, used as the status check of each). The hub session also includes `hub_acquire`, `hub_note` and `hub_release` (~67 tokens), which have no addon counterpart.
 
-| | Standard addon | Blender Hub 0.11.0 | Difference |
+| | Standard addon | Blender Hub 0.13.0 | Difference |
 |---|---|---|---|
-| tool definitions + instructions (sent with every request) | ~6,070 (10 tools) | ~2,750 (21 tools) | **−55%** |
+| tool definitions + instructions (sent with every request) | ~6,070 (10 tools) | ~3,130 (23 tools) | **−48%** |
 | review in 12 angles | ~1,150 (2 images of 6) | ~1,090 (1 sheet) | −5% |
 | repeated review of an unchanged model | ~1,150 | ~70 | **−94%** |
 | viewport capture at 1024 px | ~810 | ~830 | +3% |
 | `exec` reply | ~8 | ~10 | +2 tokens |
-| **typical session, same quality** (12 angles, 1024 px captures) | **~14,300** | **~10,900** | **−24%** |
-| typical session, addon at its defaults (4 angles, 768 px captures; the hub still shows 12 angles at 1024 px) | ~11,700 | ~10,900 | −7%, with the hub showing more |
+| **typical session, same quality** (12 angles, 1024 px captures) | **~14,300** | **~11,260** | **−21%** |
+| typical session, addon at its defaults (4 angles, 768 px captures; the hub still shows 12 angles at 1024 px) | ~11,700 | ~11,260 | −4%, with the hub showing more |
+
+Feature parity (0.13.0): everything the addon offers except AI 3D/world generation, which is out of scope (the hub is for agents that model): scene facts, viewport/camera/angles/animation views in solid, x-ray, wireframe, material, EEVEE and Cycles, images such as the Render Result, and the Poly Haven, Sketchfab and Poly Pizza libraries.
 
 Not in the session totals: repeated reviews (every review is counted as a new image there), the code an agent no longer re-sends when using `script=`, and parallel agents (the addon talks to one Blender on one port; the hub runs up to 10 workers by default, configurable with `BLENDER_HUB_MAX_WORKERS`).
 

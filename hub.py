@@ -24,7 +24,7 @@ import subprocess
 import threading
 import contextlib
 
-VERSION = "0.12.0"
+VERSION = "0.13.0"
 HERE = os.path.dirname(os.path.abspath(__file__))
 WORKER = os.path.join(HERE, "worker.py")
 sys.path.insert(0, HERE)
@@ -802,9 +802,10 @@ class Hub:
 
 # ======================================================================= MCP
 S = {"type": "string"}
-TOKEN = {"type": "string", "description": "from hub_acquire/hub_lease"}
-KEY = {"type": "string", "description": "only to resume an agent after its lease expired"}
-NOTE = {"type": "string", "description": "short line: what this step does (shown live)"}
+# explained once in the server instructions instead of in every tool (tool definitions are sent with every request)
+TOKEN = S
+KEY = S
+NOTE = S
 WIN = "(window workers)"
 TOOLS = [
     ("hub_acquire", "Lease a free Blender worker (boots one if needed). Opens a window the user watches live by default; gui=false for background/batch. Returns worker + token (keep both). mode: exclusive (default) | shared. When done: hub_release, then ask the user before closing the window (hub_stop_worker).",
@@ -822,8 +823,8 @@ TOOLS = [
      {"name": S, "blend": S, "gui": {"type": "boolean"}}, ["name"]),
     ("hub_view", f"Frame the user's viewport on a collection/objects {WIN}. Optional shading (VERTEX, MATERIAL).",
      {"worker": S, "token": TOKEN, "collection": S, "objects": {"type": "array", "items": S}, "shading": S}, ["worker", "token"]),
-    ("hub_screenshot", f"What the user sees {WIN}: the 3D viewport, longest side `size` px (default 1024). full=true for the whole window. Prefer hub_turntable to review a model.",
-     {"worker": S, "token": TOKEN, "size": {"type": "integer"}, "full": {"type": "boolean"}}, ["worker", "token"]),
+    ("hub_screenshot", f"What the user sees {WIN}: the 3D viewport, longest side `size` px (default 1024). full=true: whole window; shading: solid/material/rendered/wireframe for this capture; image: Render Result, an image name or file (any worker). Prefer hub_turntable.",
+     {"worker": S, "token": TOKEN, "size": {"type": "integer"}, "full": {"type": "boolean"}, "shading": S, "image": S}, ["worker", "token"]),
     ("hub_stop_worker", "Stop a worker (refused while another session holds a lease).", {"name": S, "token": TOKEN}, ["name"]),
     ("hub_restart_worker", "Boot a dead/closed worker again from its newest autosave (keeps its window mode unless gui is given).",
      {"name": S, "gui": {"type": "boolean"}}, ["name"]),
@@ -842,10 +843,22 @@ TOOLS = [
      {"worker": S, "token": TOKEN, "agent": S, "agent_key": KEY, "task": S}, ["worker", "token", "agent", "task"]),
     ("hub_measure", "Distance, intersection and penetration between objects a and b (world space). Move b by -delta_a_to_b to make it touch a (null if they penetrate).",
      {"worker": S, "token": TOKEN, "a": S, "b": S, "tol": {"type": "number"}}, ["worker", "token", "a", "b"]),
-    ("hub_turntable", "Review sheet: N renders around a collection/objects (low to high), returned as one image. views default 12, size default 256 px per view; shading=rendered: EEVEE (materials, emissive, light; hub lights when isolate=true, the default (false shows other objects, never reuses); color ignored; image/object-reading materials always re-render), default solid (Workbench); frames=true also lists the frame files. If what is drawn did not change since your last identical turntable it answers unchanged (no image; that sheet is still valid); force=true renders anyway — use it if the earlier image is no longer in your context.",
+    ("hub_turntable", "Review sheet: N renders around collection/objects (low to high) as one image; views 12, size 256 px each. shading: solid (form, color), xray, wireframe, rendered (EEVEE) or cycles (materials, emissive, light; hub lights unless isolate=false). camera=scene: the scene camera; timeline: N frames or a list over the animation. An unchanged model answers unchanged without an image (force=true renders again, e.g. if that image left your context); frames=true lists the files.",
      {"worker": S, "token": TOKEN, "agent": S, "agent_key": KEY, "collection": S, "objects": {"type": "array", "items": S},
-      "views": {"type": "integer"}, "size": {"type": "integer"}, "color": S, "shading": {"type": "string", "enum": ["solid", "rendered"]}, "isolate": {"type": "boolean"}, "note": NOTE, "frames": {"type": "boolean"}, "force": {"type": "boolean"}},
+      "views": {"type": "integer"}, "size": {"type": "integer"}, "color": S,
+      "shading": {"type": "string", "enum": ["solid", "xray", "wireframe", "rendered", "cycles"]}, "isolate": {"type": "boolean"},
+      "camera": S, "timeline": {"anyOf": [{"type": "integer"}, {"type": "array", "items": {"type": "integer"}}]},
+      "note": NOTE, "frames": {"type": "boolean"}, "force": {"type": "boolean"}},
      ["worker", "token", "agent"]),
+    ("hub_scene", "Scene facts as text, one line per object. fields: location size ground rotation scale parent children hidden details materials modifiers animation topology weights settings (default: location size children hidden). query filters names; root lists a hierarchy; limit 20.",
+     {"worker": S, "token": TOKEN, "query": S, "root": S, "fields": {"type": "array", "items": S}, "limit": {"type": "integer"}},
+     ["worker", "token"]),
+    ("hub_assets", "Asset libraries. search: query in polyhaven (CC0; filters type hdris/textures/models, category, min_size_m), sketchfab or polypizza (low poly) (filters category, licence CC0/CC-BY, animated); previews=N (max 6) adds one thumbnail image. import asset_id (polyhaven type is looked up if omitted): models into Agent_<agent> (target_size m, required for sketchfab); polyhaven textures make a material (apply_to); hdris set the world (exclusive lease); resolution 1k-8k. Keys in the hub env: SKETCHFAB_API_KEY (import), POLYPIZZA_API_KEY.",
+     {"worker": S, "token": TOKEN, "agent": S, "agent_key": KEY, "action": {"type": "string", "enum": ["search", "import"]},
+      "source": {"type": "string", "enum": ["polyhaven", "sketchfab", "polypizza"]}, "query": S, "filters": {"type": "object"},
+      "limit": {"type": "integer"}, "previews": {"type": "integer"}, "asset_id": S, "target_size": {"type": "number"},
+      "apply_to": {"type": "array", "items": S}, "resolution": S, "note": NOTE},
+     ["worker", "token", "agent", "action"]),
     ("hub_export_collection", "Save your collection to a .blend.",
      {"worker": S, "token": TOKEN, "agent": S, "agent_key": KEY, "collection": S, "path": S, "note": NOTE},
      ["worker", "token", "agent", "collection", "path"]),
@@ -857,7 +870,7 @@ TOOLS = [
 _MAP = {"hub_lease": "lease", "hub_renew": "renew", "hub_release": "release", "hub_exec": "exec",
         "hub_measure": "measure", "hub_turntable": "turntable", "hub_export_collection": "export_collection",
         "hub_merge": "merge", "hub_save": "save", "hub_agent_key": "agent_key", "hub_view": "view",
-        "hub_screenshot": "screenshot", "hub_note": "note"}
+        "hub_screenshot": "screenshot", "hub_note": "note", "hub_scene": "scene", "hub_assets": "assets"}
 
 
 def _short_status(st):
@@ -936,6 +949,19 @@ def _tool_call(hub, name, args):
                 out[n] = {"error": f"no answer: {e}"}
         return out, None
     args = {k: v for k, v in args.items() if not str(k).startswith("_")}  # internal keys are not passed through
+    if name == "hub_assets" and isinstance(args.get("filters"), str):  # some clients send objects as JSON text
+        try:
+            args["filters"] = json.loads(args["filters"])
+        except ValueError:
+            raise ValueError("filters must be an object, e.g. {\"type\": \"models\"}")
+    if name == "hub_assets" and args.get("filters") is not None and not isinstance(args["filters"], dict):
+        raise ValueError("filters must be an object, e.g. {\"type\": \"models\"}")
+    if name == "hub_assets" and isinstance(args.get("filters"), dict):  # one schema slot for the per-source filters
+        allowed = {"type", "category", "min_size_m", "licence", "animated", "file_format"}
+        bad = sorted(set(args["filters"]) - allowed)
+        if bad:
+            raise ValueError(f"unknown filters {bad}; use {sorted(allowed)}")
+        args = {**{k: v for k, v in args.items() if k != "filters"}, **args["filters"]}
     worker = args.pop("worker")
     r = hub.call(worker, _MAP[name], **args)
     if not r.get("ok"):
@@ -961,7 +987,10 @@ def _tool_call(hub, name, args):
                           "note": "model unchanged since your last identical turntable: that sheet is still valid "
                                   "(force=true to render again)"}
         return data, None
-    shot = res.get("sheet") if name == "hub_turntable" else (res.get("path") if name == "hub_screenshot" else None)
+    if name == "hub_scene" and isinstance(res, dict) and "text" in res:
+        data["result"] = res["text"]
+    shot = (res.get("sheet") if name in ("hub_turntable", "hub_assets") else
+            (res.get("path") if name == "hub_screenshot" else None)) if isinstance(res, dict) else None
     if shot and os.path.exists(shot):
         with open(shot, "rb") as f:
             img = base64.b64encode(f.read()).decode("ascii")
@@ -996,9 +1025,10 @@ def serve_mcp():
                        "capabilities": {"tools": {}},
                        "serverInfo": {"name": "blender-hub", "version": VERSION},
                        "instructions": "Multi-agent Blender. hub_acquire(label=...) -> keep worker+token (a window the user watches opens by default). "
-                                       "Use one `agent` name; keep the agent_key from its first call. hub_note(task=) at start, note= on each hub_exec. "
+                                       "Use one `agent` name; keep the agent_key from its first call (pass it only to resume after the lease expired). "
+                                       "hub_note(task=) at start; note= (short line, shown live) on each hub_exec. "
                                        "Change only your Agent_<agent> collection; undo anything listed in `violations`; `notices` mean someone changed your objects. "
-                                       "Review with hub_turntable (one image), fit parts with hub_measure; use hub_screenshot sparingly (images cost tokens). "
+                                       "Review with hub_turntable (one image), fit parts with hub_measure, read positions/sizes with hub_scene (text); use hub_screenshot sparingly (images cost tokens). "
                                        "Done: hub_release, ask the user before closing the window."}
             elif method == "tools/list":
                 res = {"tools": [{"name": n, "description": d,

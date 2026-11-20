@@ -42,6 +42,7 @@ import traceback
 import io
 import contextlib
 import linecache
+import shutil
 
 import bpy
 import bmesh
@@ -53,7 +54,7 @@ try:
 except Exception:
     np = None
 
-VERSION = "0.12.0"
+VERSION = "0.13.0"
 LEASE_TTL_DEFAULT = 900.0
 LEASE_TTL_MAX = 3600.0
 NET_CMDS = {"ping", "status", "check_token"}   # answered outside the queue, without bpy
@@ -636,10 +637,14 @@ def _set_eevee(render):
     raise RuntimeError("no EEVEE engine in this Blender")
 
 
+SHADINGS = ("solid", "rendered", "cycles", "wireframe", "xray")
+LIT = ("rendered", "cycles")  # real render engines: the hub's light rig, materials, emissive
+
+
 def _shading_arg(req):
     sh = str(req.get("shading") or "solid").lower()
-    if sh not in ("solid", "rendered"):
-        raise ValueError("shading must be 'solid' (Workbench) or 'rendered' (EEVEE)")
+    if sh not in SHADINGS:
+        raise ValueError("shading must be one of " + ", ".join(SHADINGS))
     return sh
 
 
@@ -836,23 +841,42 @@ def cmd_screenshot(req):
     """Window mode: what the user is seeing. By default only the 3D viewport, scaled so its longest side is
     `size` px (default 1024): image tokens grow with pixels, and the panels around the viewport rarely matter.
     full=true captures the whole window."""
-    win = _gui_window()
     out_dir = os.path.join(ARGS["state"], "renders", ARGS["name"])
     os.makedirs(out_dir, exist_ok=True)
     path = os.path.join(out_dir, f"screen_{int(time.time() * 1000)}.png")
     size = min(max(int(req.get("size") or 1024), 256), 2048)
+    if req.get("image"):  # an image instead of the screen: "Render Result", an image in the file, or a file path
+        return _image_to_png(str(req["image"]), path, size)
+    win = _gui_window()
     full = bool(req.get("full"))
     _redraw()
     area, region = (None, None) if full else _view3d(win)
-    with bpy.context.temp_override(window=win):
-        with contextlib.suppress(Exception):  # actually draw now (otherwise the screenshot may show the previous scene)
-            bpy.ops.wm.redraw_timer(type="DRAW_WIN_SWAP", iterations=1)
-    if area is not None:
-        with bpy.context.temp_override(window=win, area=area, region=region):
-            bpy.ops.screen.screenshot_area(filepath=path)
+    if area is None:
+        area_v, _r = _view3d(win)
     else:
+        area_v = area
+    sp = area_v.spaces.active if area_v is not None else None
+    want = str(req.get("shading") or "").upper()
+    if want and want not in ("SOLID", "MATERIAL", "RENDERED", "WIREFRAME"):
+        raise ValueError("shading must be solid, material, rendered or wireframe")
+    prev = sp.shading.type if (sp is not None and want) else None
+    try:
+        if prev is not None and want != prev:
+            sp.shading.type = want
         with bpy.context.temp_override(window=win):
-            bpy.ops.screen.screenshot(filepath=path)
+            with contextlib.suppress(Exception):  # actually draw now (otherwise the screenshot may show the previous scene)
+                # rendered viewport converges over several redraws
+                bpy.ops.wm.redraw_timer(type="DRAW_WIN_SWAP", iterations=24 if want == "RENDERED" else 1)
+        if area is not None:
+            with bpy.context.temp_override(window=win, area=area, region=region):
+                bpy.ops.screen.screenshot_area(filepath=path)
+        else:
+            with bpy.context.temp_override(window=win):
+                bpy.ops.screen.screenshot(filepath=path)
+    finally:
+        if prev is not None and sp.shading.type != prev:
+            with contextlib.suppress(Exception):
+                sp.shading.type = prev
     w = h = None
     img = None
     try:
@@ -1180,8 +1204,10 @@ def _tt_fingerprint(obs, color, shading="solid"):
     # scene-level settings that change the pixels (whatever the turntable does not force to a fixed value)
     parts = [shading, _rna_props(sc.display.shading), _rna_props(sc.display), _rna_props(sc.view_settings, deep=True),
              _rna_props(sc.display_settings), _rna_props(sc.render, deep=True), _rna_props(vl)]
-    if shading == "rendered":
+    if shading in LIT:
         parts.append(_rna_props(sc.eevee, deep=True))
+        if shading == "cycles" and hasattr(sc, "cycles"):
+            parts.append(_rna_props(sc.cycles, deep=True))
         for ob in obs:
             for s in ob.material_slots:
                 mt = s.material
@@ -1265,11 +1291,29 @@ def cmd_turntable(req):
         raise ValueError("views must be between 1 and 48")
     size = min(max(int(req.get("size", 256)), 64), 1024)
     shading = _shading_arg(req)
+    scene_cam = str(req.get("camera") or "").lower() == "scene"
+    if req.get("camera") and not scene_cam:
+        raise ValueError("camera must be 'scene' (the scene camera) or omitted (orbit)")
+    if scene_cam and bpy.context.scene.camera is None:
+        raise ValueError("camera='scene' but the scene has no camera")
+    timeline = _timeline_frames(req.get("timeline"))
+    warning = None
+    if timeline:
+        n = len(timeline)
+        sims = _unbaked_sims()
+        if sims and not req.get("force"):
+            raise RuntimeError("a timeline jumps frames and would reset unbaked simulations (" + ", ".join(sims[:6])
+                               + "): bake them first, or pass force=true to accept that their caches are reset")
+        if sims:
+            warning = "unbaked simulation caches were reset by the timeline: " + ", ".join(sims[:6])
+    elif scene_cam:
+        n = 1
     isolate_req = req.get("isolate", True)
     key = (req["_agent"], tuple(sorted(o.name for o in obs)), n, size, shading, str(req.get("color", "MATERIAL")),
            str(req.get("elev")), bpy.context.scene.frame_current)
     # no reuse without isolation (other objects show) or with a caller-chosen tag/out_dir (the file may be overwritten)
-    reusable = isolate_req and not req.get("tag") and not req.get("out_dir")
+    # never with the scene camera or a timeline: the fingerprint covers the targets at this frame, from the orbit
+    reusable = isolate_req and not req.get("tag") and not req.get("out_dir") and not scene_cam and not timeline
     fp = None
     if reusable:
         try:
@@ -1280,7 +1324,9 @@ def cmd_turntable(req):
     if (fp and not req.get("force") and cached and cached[0] == fp and cached[1].get("sheet")
             and os.path.exists(cached[1]["sheet"]) and os.path.getmtime(cached[1]["sheet"]) == cached[2]):
         return dict(cached[1], unchanged=True)
-    result = _turntable_render(req, obs, n, size, shading)
+    result = _turntable_render(req, obs, n, size, shading, timeline, scene_cam)
+    if warning:
+        result["warning"] = warning
     if fp and result.get("sheet") and os.path.exists(result["sheet"]):
         TT_CACHE[key] = (fp, result, os.path.getmtime(result["sheet"]))
         while len(TT_CACHE) > TT_CACHE_MAX:
@@ -1288,7 +1334,160 @@ def cmd_turntable(req):
     return result
 
 
-def _turntable_render(req, obs, n, size, shading="solid"):
+def _timeline_frames(v):
+    """timeline: a count (2-48, spread over the scene frame range) or an explicit list of frame numbers."""
+    if v in (None, False, 0, "", []):
+        return None
+    sc = bpy.context.scene
+    if isinstance(v, (list, tuple)):
+        fr = [int(x) for x in v][:48]
+    else:
+        k = int(v)
+        if k < 2 or k > 48:
+            raise ValueError("timeline must be 2-48 frames or a list of frame numbers")
+        a, b = sc.frame_start, sc.frame_end
+        fr = sorted({round(a + (b - a) * i / (k - 1)) for i in range(k)})
+    if not fr:
+        raise ValueError("timeline has no frames")
+    return fr
+
+
+def _wire_copies(obs, tag, size, rig, scene_cam=False):
+    """World-space copies of the evaluated meshes with a Wireframe modifier about 1.5 px thick at this tile size."""
+    dg = bpy.context.evaluated_depsgraph_get()
+    lo, hi = _bbox(obs)
+    thick = max((hi - lo).length, 1e-3) * 1.08 * 1.5 / size  # orbit: the target fills the tile
+    cam = bpy.context.scene.camera if scene_cam else None
+    if cam is not None:  # the user's camera decides how big the model looks
+        cd = cam.data
+        if cd.type == "ORTHO":
+            world_px = cd.ortho_scale / size
+        else:
+            d = max((cam.matrix_world.translation - (lo + hi) / 2).length, 1e-3)
+            world_px = 2 * d * math.tan(cd.angle / 2) / size
+        thick = 1.5 * world_px
+    out = []
+    sc = bpy.context.scene
+    for i, o in enumerate(obs):
+        me = bpy.data.meshes.new_from_object(o.evaluated_get(dg))
+        rig.append(("mesh", me))
+        me.transform(o.matrix_world)  # world space: the thickness is in metres whatever the object scale
+        wo = bpy.data.objects.new(f"hub_wire_{tag}_{i}", me)
+        rig.append(("object", wo))
+        wo.color = o.color
+        for j, slot in enumerate(o.material_slots):  # object-linked materials too
+            if j < len(wo.material_slots) and slot.link == "OBJECT":
+                wo.material_slots[j].link = "OBJECT"
+                wo.material_slots[j].material = slot.material
+        md = wo.modifiers.new("wire", "WIREFRAME")
+        md.thickness = thick
+        md.use_relative_offset = False
+        sc.collection.objects.link(wo)
+        out.append((wo, me))
+    return out
+
+
+def _drop_wires(wires, rig):
+    for wo, me in wires:
+        with contextlib.suppress(Exception):
+            bpy.data.objects.remove(wo)
+        with contextlib.suppress(Exception):
+            bpy.data.meshes.remove(me)
+        rig[:] = [x for x in rig if x[1] is not wo and x[1] is not me]
+
+
+_ANIM_COLLS = ("objects", "meshes", "materials", "shape_keys", "cameras", "lights", "worlds", "node_groups",
+               "armatures", "curves", "hair_curves", "scenes", "grease_pencils", "grease_pencils_v3", "lattices",
+               "particles", "textures", "speakers", "metaballs", "volumes", "pointclouds", "linestyles",
+               "cache_files", "masks", "movieclips")
+_CUSTOM_KEY = re.compile(r"""^(.*)\[(["'])(.*)\2\]$""")  # ...["key"]: a custom property
+
+
+def _fcurves(action):
+    fcs = getattr(action, "fcurves", None)
+    if fcs is None:  # 5.x layered actions
+        fcs = []
+        with contextlib.suppress(Exception):
+            fcs = [fc for layer in action.layers for strip in layer.strips for cb in strip.channelbags for fc in cb.fcurves]
+    return list(fcs or [])
+
+
+def _unbaked_sims():
+    """Simulation caches a frame jump would reset (and returning to the frame would not rebuild)."""
+    sc = bpy.context.scene
+    out = []
+    rbw = sc.rigidbody_world
+    if rbw is not None and rbw.enabled and rbw.collection and len(rbw.collection.objects) \
+            and not (rbw.point_cache and rbw.point_cache.is_baked):
+        out.append("rigid body world")
+    for o in sc.objects:
+        for m in o.modifiers:
+            pc = getattr(m, "point_cache", None)
+            if pc is not None and not pc.is_baked:
+                out.append(f"{o.name}: {m.type.lower()}")
+            elif m.type == "FLUID" and getattr(m, "fluid_type", "") == "DOMAIN":
+                out.append(f"{o.name}: fluid domain")
+            elif m.type == "NODES" and m.node_group and any(
+                    n.bl_idname == "GeometryNodeSimulationOutput" for n in _all_nodes(m.node_group, set())):
+                out.append(f"{o.name}: geometry nodes simulation")  # bake state is not exposed reliably: assume unbaked
+        for ps in getattr(o, "particle_systems", []):
+            if ps.settings.type == "EMITTER" or getattr(ps.settings, "use_hair_dynamics", False) or ps.use_hair_dynamics:
+                if not ps.point_cache.is_baked:
+                    out.append(f"{o.name}: particles {ps.name}")
+    return out
+
+
+def _animated_values():
+    """Current values of every animated property, so a temporary frame change does not lose unkeyed edits."""
+    out, seen = [], set()
+    for cn in _ANIM_COLLS:
+        for idb in getattr(bpy.data, cn, []) or []:
+            ad = getattr(idb, "animation_data", None)
+            if not ad:
+                continue
+            actions = [ad.action] if ad.action else []
+            with contextlib.suppress(Exception):  # NLA-only animation too
+                actions += [st.action for tr in ad.nla_tracks for st in tr.strips if st.action]
+            for act in actions:
+                for fc in _fcurves(act):
+                    k = (idb.as_pointer(), fc.data_path, fc.array_index)
+                    if k in seen:
+                        continue
+                    seen.add(k)
+                    with contextlib.suppress(Exception):
+                        prop = idb.path_resolve(fc.data_path)
+                        if hasattr(prop, "__len__") and not isinstance(prop, str):
+                            out.append((idb, fc.data_path, fc.array_index, prop[fc.array_index]))
+                        else:
+                            out.append((idb, fc.data_path, -1, prop))
+    return out
+
+
+def _restore_animated(vals):
+    for idb, path, idx, v in vals:
+        with contextlib.suppress(Exception):
+            m = _CUSTOM_KEY.match(path)
+            if m:  # custom property: ["key"] or pose.bones["Arm"]["ik"]
+                owner = idb.path_resolve(m.group(1)) if m.group(1) else idb
+                key = m.group(3).replace('\\"', '"').replace("\\'", "'")
+                if idx < 0:
+                    owner[key] = v
+                else:
+                    owner[key][idx] = v
+            elif idx < 0:
+                if "." in path:
+                    owner_path, attr = path.rsplit(".", 1)
+                    setattr(idb.path_resolve(owner_path), attr, v)
+                else:
+                    setattr(idb, path, v)
+            else:
+                idb.path_resolve(path)[idx] = v
+    if vals:
+        with contextlib.suppress(Exception):
+            bpy.context.view_layer.update()
+
+
+def _turntable_render(req, obs, n, size, shading="solid", timeline=None, scene_cam=False):
     out_dir = req.get("out_dir") or os.path.join(ARGS["state"], "renders", ARGS["name"])
     os.makedirs(out_dir, exist_ok=True)
     tag = f"{req['_agent']}_{re.sub(r'[^A-Za-z0-9_-]', '', str(req.get('tag') or int(time.time() * 1000)))}"
@@ -1298,6 +1497,16 @@ def _turntable_render(req, obs, n, size, shading="solid"):
     shd = sc.display.shading
     vs = sc.view_settings
     world = sc.world
+    lit = shading in LIT
+    # scene camera: tiles keep the render aspect (before resolution and pixel aspect are forced below)
+    aspect = (r.resolution_y * r.pixel_aspect_y) / max(r.resolution_x * r.pixel_aspect_x, 1e-6)
+    if scene_cam:  # longest side = size, the other keeps the camera's aspect (same framing as the user's camera)
+        tile_w, tile_h = (size, max(16, round(size * aspect))) if aspect <= 1 else (max(16, round(size / aspect)), size)
+    else:
+        tile_w, tile_h = size, size
+    frame0, subframe0 = sc.frame_current, sc.frame_subframe
+    anim_vals = _animated_values() if timeline else []  # frame_set below re-evaluates fcurves: keep unkeyed edits
+    wires = []
     saved = [(r, k, getattr(r, k)) for k in ("engine", "resolution_x", "resolution_y", "resolution_percentage",
                                              "filepath", "film_transparent")]
     # look first: restored in reverse order, so the look is set back AFTER its view transform
@@ -1317,7 +1526,10 @@ def _turntable_render(req, obs, n, size, shading="solid"):
     for obj, attr, _v in neutral:
         if hasattr(obj, attr):
             saved.append((obj, attr, getattr(obj, attr)))
-    saved += [(shd, k, getattr(shd, k)) for k in ("light", "color_type", "show_cavity")]
+    saved += [(shd, k, getattr(shd, k)) for k in ("light", "color_type", "show_cavity", "show_xray", "xray_alpha")]
+    cy = getattr(sc, "cycles", None)
+    if shading == "cycles" and cy is not None:
+        saved += [(cy, k, getattr(cy, k)) for k in ("samples", "use_denoising", "use_adaptive_sampling") if hasattr(cy, k)]
     if world:
         saved.append((world, "color", tuple(world.color)))
     saved.append((sc, "world", world))
@@ -1325,7 +1537,7 @@ def _turntable_render(req, obs, n, size, shading="solid"):
     if ee is not None and hasattr(ee, "taa_render_samples"):
         saved.append((ee, "taa_render_samples", ee.taa_render_samples))
     frames, sheet, cam, cam_data = [], None, None, None
-    rig = []  # temporary lights/world of the rendered mode, removed in finally
+    rig = []  # temporary lights/world/wire copies, removed in finally
     try:
         for obj, attr, v in neutral:
             with contextlib.suppress(Exception):
@@ -1354,13 +1566,29 @@ def _turntable_render(req, obs, n, size, shading="solid"):
             if lc.exclude and any(o.name in names for o in lc.collection.all_objects):
                 saved.append((lc, "exclude", True))
                 lc.exclude = False
-        cam_data = bpy.data.cameras.new(f"hub_cam_{tag}")
-        cam = bpy.data.objects.new(f"hub_cam_{tag}", cam_data)
-        sc.collection.objects.link(cam)
-        if shading == "rendered":
-            _set_eevee(r)
-            if ee is not None and hasattr(ee, "taa_render_samples"):
-                ee.taa_render_samples = 16  # at <= 1024 px per view more samples change nothing visible
+        if scene_cam:
+            cam = None  # the user's camera, untouched
+        else:
+            cam_data = bpy.data.cameras.new(f"hub_cam_{tag}")
+            cam = bpy.data.objects.new(f"hub_cam_{tag}", cam_data)
+            sc.collection.objects.link(cam)
+        if lit:
+            if shading == "cycles":
+                try:
+                    r.engine = "CYCLES"
+                except TypeError as e:
+                    raise RuntimeError("the Cycles add-on is disabled in this Blender: enable it, or use "
+                                       "shading='rendered' (EEVEE) or 'solid'") from e
+                if cy is not None:
+                    cy.samples = 16  # + denoising: clean at <= 1024 px per view
+                    with contextlib.suppress(Exception):
+                        cy.use_denoising = True
+                    with contextlib.suppress(Exception):
+                        cy.use_adaptive_sampling = True
+            else:
+                _set_eevee(r)
+                if ee is not None and hasattr(ee, "taa_render_samples"):
+                    ee.taa_render_samples = 16  # at <= 1024 px per view more samples change nothing visible
             no_light = sc.world is None and not any(
                 o.type == "LIGHT" and not o.hide_render and not any(c.hide_render for c in o.users_collection)
                 for o in bpy.context.view_layer.objects)  # lights the render can actually see
@@ -1395,7 +1623,16 @@ def _turntable_render(req, obs, n, size, shading="solid"):
                 alt = {"ATTRIBUTE": "VERTEX", "VERTEX": "ATTRIBUTE"}.get(want)
                 shd.color_type = alt if alt else "MATERIAL"
             shd.show_cavity = True
-        r.resolution_x = r.resolution_y = size
+            if shading == "xray":
+                shd.show_xray = True
+                shd.xray_alpha = 0.35
+            if shading == "wireframe":  # Workbench ignores display_type WIRE: wire copies of the evaluated meshes
+                for o in obs:
+                    if not o.hide_render:
+                        saved.append((o, "hide_render", False))
+                        o.hide_render = True
+                wires = _wire_copies(obs, tag, size, rig, scene_cam)
+        r.resolution_x, r.resolution_y = tile_w, tile_h
         r.resolution_percentage = 100
         r.image_settings.file_format = "PNG"
         r.film_transparent = False
@@ -1403,37 +1640,61 @@ def _turntable_render(req, obs, n, size, shading="solid"):
             vs.view_transform = "Standard"
         with contextlib.suppress(TypeError):
             vs.look = "None"
-        if world and shading == "solid":
-            world.color = (0.55, 0.57, 0.6)
-        sc.camera = cam
-        lo, hi = _bbox(obs)
-        center = (lo + hi) / 2
-        radius = max((hi - lo).length / 2, 1e-3)
-        cam_data.lens_unit = "FOV"
-        dist = radius / math.sin(cam_data.angle / 2) * 1.08
-        cam_data.clip_start = max(dist - radius * 2, 1e-3) * 0.5
-        cam_data.clip_end = dist + radius * 4
+        if not lit:
+            if world is None:  # Workbench takes the background from the world: without one the sheet is blank
+                tw = bpy.data.worlds.new(f"hub_world_{tag}")
+                rig.append(("world", tw))
+                sc.world = tw
+            sc.world.color = (0.55, 0.57, 0.6)
+        if cam is not None:
+            sc.camera = cam
+            if timeline:  # frame the whole motion, not only the current pose
+                lo, hi = None, None
+                for f in timeline:
+                    sc.frame_set(f)
+                    a_, b_ = _bbox(obs)
+                    lo = a_ if lo is None else mathutils.Vector(map(min, lo, a_))
+                    hi = b_ if hi is None else mathutils.Vector(map(max, hi, b_))
+            else:
+                lo, hi = _bbox(obs)
+            center = (lo + hi) / 2
+            radius = max((hi - lo).length / 2, 1e-3)
+            cam_data.lens_unit = "FOV"
+            dist = radius / math.sin(cam_data.angle / 2) * 1.08
+            cam_data.clip_start = max(dist - radius * 2, 1e-3) * 0.5
+            cam_data.clip_end = dist + radius * 4
         el_lo, el_hi = req.get("elev", (-15.0, 60.0))
         for i in range(n):
-            az = math.radians(i * 360.0 / n + 30)
-            el = math.radians(el_lo + (el_hi - el_lo) * (i / max(n - 1, 1)))
-            pos = center + mathutils.Vector((math.cos(el) * math.cos(az), math.cos(el) * math.sin(az), math.sin(el))) * dist
-            cam.location = pos
-            cam.rotation_euler = (center - pos).to_track_quat("-Z", "Y").to_euler()
+            if timeline:
+                sc.frame_set(timeline[i])
+                if shading == "wireframe":  # the copies are meshes of one pose: rebuild them for this frame
+                    _drop_wires(wires, rig)
+                    wires = _wire_copies(obs, tag, size, rig, scene_cam)
+            if cam is not None:
+                if timeline:  # one fixed three-quarter view for the whole strip
+                    az, el = math.radians(30), math.radians(20)
+                else:
+                    az = math.radians(i * 360.0 / n + 30)
+                    el = math.radians(el_lo + (el_hi - el_lo) * (i / max(n - 1, 1)))
+                pos = center + mathutils.Vector((math.cos(el) * math.cos(az), math.cos(el) * math.sin(az), math.sin(el))) * dist
+                cam.location = pos
+                cam.rotation_euler = (center - pos).to_track_quat("-Z", "Y").to_euler()
             path = os.path.join(out_dir, f"{tag}_{i:02d}.png")
             r.filepath = path
             try:
                 bpy.ops.render.render(write_still=True)
             except Exception as e:
                 if shading == "rendered":
-                    raise RuntimeError(f"shading='rendered' (EEVEE) failed: {e}. It needs a Blender that can use the "
-                                       "GPU (a window, or -b with a GPU); use shading='solid' here") from e
+                    raise RuntimeError(f"shading='rendered' failed: {e}. EEVEE needs a Blender that can use the GPU "
+                                       "(a window, or -b with a GPU); use shading='cycles' (CPU) or 'solid'") from e
+                if shading == "cycles":
+                    raise RuntimeError(f"shading='cycles' failed: {e}") from e
                 raise
             frames.append(path)
         if np is not None and req.get("sheet", True):
             cols = min(int(req.get("cols", 4)), n)
             rows = math.ceil(n / cols)
-            grid = np.zeros((rows * size, cols * size, 4), dtype=np.float32)
+            grid = np.zeros((rows * tile_h, cols * tile_w, 4), dtype=np.float32)
             for i, p in enumerate(frames):
                 img = bpy.data.images.load(p, check_existing=False)
                 img.colorspace_settings.is_data = True
@@ -1441,10 +1702,11 @@ def _turntable_render(req, obs, n, size, shading="solid"):
                 img.pixels.foreach_get(px)
                 px = px.reshape(img.size[1], img.size[0], 4)
                 rr, cc = divmod(i, cols)
-                y0 = (rows - 1 - rr) * size
-                grid[y0:y0 + size, cc * size:(cc + 1) * size] = px[:size, :size]
+                y0 = (rows - 1 - rr) * tile_h
+                ph, pw = min(tile_h, px.shape[0]), min(tile_w, px.shape[1])
+                grid[y0:y0 + ph, cc * tile_w:cc * tile_w + pw] = px[:ph, :pw]
                 bpy.data.images.remove(img)
-            sheet_img = bpy.data.images.new(f"hub_sheet_{tag}", cols * size, rows * size, alpha=True)
+            sheet_img = bpy.data.images.new(f"hub_sheet_{tag}", cols * tile_w, rows * tile_h, alpha=True)
             sheet_img.colorspace_settings.is_data = True
             sheet_img.pixels.foreach_set(grid.ravel())
             sheet = os.path.join(out_dir, f"{tag}_sheet.png")
@@ -1462,12 +1724,707 @@ def _turntable_render(req, obs, n, size, shading="solid"):
         for obj, attr, val in reversed(saved):  # field by field, in reverse order
             with contextlib.suppress(Exception):
                 setattr(obj, attr, val)
-        for want in ("object", "light", "world"):  # objects before the light data they use
+        if timeline or sc.frame_current != frame0 or sc.frame_subframe != subframe0:
+            with contextlib.suppress(Exception):
+                sc.frame_set(frame0, subframe=subframe0)
+            _restore_animated(anim_vals)
+        _drop_wires(wires, rig)
+        for want in ("object", "light", "mesh", "world"):  # objects before the data they use
             for kind, idb in rig:
                 if kind == want:
                     with contextlib.suppress(Exception):
-                        {"object": bpy.data.objects, "light": bpy.data.lights, "world": bpy.data.worlds}[kind].remove(idb)
-    return {"frames": frames, "sheet": sheet, "views": n, "size": size, "shading": shading}
+                        {"object": bpy.data.objects, "light": bpy.data.lights, "world": bpy.data.worlds,
+                         "mesh": bpy.data.meshes}[kind].remove(idb)
+    out = {"frames": frames, "sheet": sheet, "views": n, "size": size, "shading": shading}
+    if timeline:
+        out["timeline"] = timeline
+    if scene_cam:
+        out["camera"] = "scene"
+    return out
+
+
+def _image_to_png(src, path, size):
+    """'Render Result', an image datablock name, or an image file path -> PNG scaled to `size` px."""
+    img, tmp = bpy.data.images.get(src), None
+    try:
+        if img is None:
+            if not os.path.isfile(src):
+                raise ValueError(f"no image named {src!r} in the file and no such file")
+            img = tmp = bpy.data.images.load(src, check_existing=False)
+        if img.type == "RENDER_RESULT":
+            img.save_render(filepath=path)  # with the scene's color management, like the render window
+            img2 = tmp = bpy.data.images.load(path, check_existing=False)
+        else:
+            img2 = img if tmp is not None else img.copy()
+            tmp = img2
+        w, h = img2.size
+        if not w or not h:
+            raise ValueError(f"image {src!r} has no pixels (render first?)")
+        sc_ = size / max(w, h)
+        if sc_ < 1.0:
+            w, h = max(1, round(w * sc_)), max(1, round(h * sc_))
+            img2.scale(w, h)
+        img2.filepath_raw = path
+        img2.file_format = "PNG"
+        img2.save()
+        return {"path": path, "size": [w, h], "area": "image", "image": src}
+    finally:
+        if tmp is not None:
+            with contextlib.suppress(Exception):
+                bpy.data.images.remove(tmp)
+
+
+# ---------------------------------------------------------------- scene facts (text, no image)
+SCENE_FIELDS = {"location", "size", "ground", "rotation", "scale", "parent", "children", "hidden", "details",
+                "materials", "modifiers", "animation", "topology", "weights", "settings"}
+
+
+def _fmt(v, nd=2):
+    return "(" + ", ".join(f"{x:.{nd}f}" for x in v) + ")"
+
+
+def _world_bbox(ob):
+    pts = [ob.matrix_world @ mathutils.Vector(c) for c in ob.bound_box]
+    return (mathutils.Vector(map(min, *pts)), mathutils.Vector(map(max, *pts)))
+
+
+def _topology(ob):
+    """Base mesh (before modifiers); in Edit Mode the live edit mesh."""
+    me = ob.data
+    edit = ob.mode == "EDIT"
+    bm = bmesh.from_edit_mesh(me) if edit else bmesh.new()
+    try:
+        if not edit:
+            bm.from_mesh(me)
+        q = t = ng = 0
+        for f in bm.faces:
+            k = len(f.verts)
+            q, t, ng = q + (k == 4), t + (k == 3), ng + (k > 4)
+        nonman = sum(1 for e in bm.edges if not e.is_manifold and not e.is_boundary)
+        bound = sum(1 for e in bm.edges if e.is_boundary)
+        loose = sum(1 for v in bm.verts if not v.link_edges)
+        poles = sum(1 for v in bm.verts if len(v.link_edges) >= 6)
+        return f"base mesh: quads {q} tris {t} ngons {ng} non-manifold {nonman} boundary {bound} loose {loose} poles {poles}"
+    finally:
+        if not edit:
+            bm.free()
+
+
+def _weights(ob):
+    arm = ob.find_armature()
+    if arm is None:
+        return "no armature"
+    deform = {b.name for b in arm.data.bones if b.use_deform}
+    groups = {g.index: g.name for g in ob.vertex_groups if g.name in deform}
+    free = sum(1 for v in ob.data.vertices if not any(g.group in groups and g.weight > 0 for g in v.groups))
+    missing = sorted(deform - {g.name for g in ob.vertex_groups})
+    return f"verts no bone moves {free}; deform bones without group {len(missing)}" + (
+        f" ({', '.join(missing[:6])}{'...' if len(missing) > 6 else ''})" if missing else "")
+
+
+def _obj_line(ob, fields):
+    parts = [f"{ob.name} [{ob.type.lower()}]"]
+    lo, hi = _world_bbox(ob)
+    for f in fields:
+        if f == "location":
+            parts.append("loc " + _fmt(ob.matrix_world.translation))
+        elif f == "size":
+            parts.append("size " + _fmt(hi - lo))
+        elif f == "ground":
+            z = lo.z
+            parts.append("on ground" if abs(z) < 1e-3 else (f"floating {z:.3f}" if z > 0 else f"below {-z:.3f}"))
+        elif f == "rotation":
+            parts.append("rot " + _fmt([math.degrees(a) for a in ob.matrix_world.to_euler()], 1))
+        elif f == "scale":
+            parts.append("scale " + _fmt(ob.matrix_world.to_scale(), 3))
+        elif f == "parent" and ob.parent:
+            parts.append("parent " + ob.parent.name)
+        elif f == "children" and ob.children:
+            parts.append(f"children {len(ob.children)}")
+        elif f == "hidden":
+            if ob.name not in bpy.context.view_layer.objects:
+                parts.append("excluded")
+            elif ob.hide_get() or ob.hide_render:
+                parts.append("hidden" + (" (render)" if ob.hide_render else ""))
+        elif f == "details":
+            if ob.type == "MESH":
+                parts.append(f"faces {len(ob.data.polygons)} verts {len(ob.data.vertices)}")
+            elif ob.type == "ARMATURE":
+                parts.append(f"bones {len(ob.data.bones)}")
+            elif ob.type == "LIGHT":
+                parts.append(f"{ob.data.type.lower()} light {ob.data.energy:g} W")
+        elif f == "materials" and getattr(ob, "material_slots", None):
+            parts.append("mats " + ",".join(s.material.name if s.material else "-" for s in ob.material_slots))
+        elif f == "modifiers" and ob.modifiers:
+            parts.append("mods " + ",".join(m.type.lower() for m in ob.modifiers))
+        elif f == "animation":
+            ad = ob.animation_data
+            if ad and ad.action:
+                fr = ad.action.frame_range
+                parts.append(f"anim {ad.action.name} {int(fr[0])}-{int(fr[1])}")
+        elif f == "topology" and ob.type == "MESH":
+            parts.append(_topology(ob))
+        elif f == "weights" and ob.type == "MESH":
+            parts.append(_weights(ob))
+    return " | ".join(parts)
+
+
+def cmd_scene(req):
+    """Scene facts as text: header + one line per object. Top-level objects by default; root=<name> lists its
+    hierarchy; query=<text> every object whose name contains it."""
+    sc = bpy.context.scene
+    vl = bpy.context.view_layer
+    fields = [f for f in (req.get("fields") or ["location", "size", "children", "hidden"]) if f in SCENE_FIELDS]
+    bad = [f for f in (req.get("fields") or []) if f not in SCENE_FIELDS]
+    if bad:
+        raise ValueError(f"unknown fields {bad}; use: {', '.join(sorted(SCENE_FIELDS))}")
+    limit = min(max(int(req.get("limit") or 20), 1), 500)
+    counts = {}
+    for o in sc.objects:
+        counts[o.type.lower()] = counts.get(o.type.lower(), 0) + 1
+    act = vl.objects.active
+    sel = [o.name for o in vl.objects if o.select_get()]
+    lines = [", ".join(f"{v} {k}" for k, v in sorted(counts.items())) +
+             f" | active {act.name if act else '-'} | selected {', '.join(sel[:5]) or '-'}"
+             f"{'...' if len(sel) > 5 else ''} | mode {bpy.context.mode.lower()}"]
+    if "settings" in fields:
+        env = None
+        if sc.world and sc.world.node_tree:
+            env = next((n.image.name for n in sc.world.node_tree.nodes if n.bl_idname == "ShaderNodeTexEnvironment"
+                        and n.image), None)
+        r = sc.render
+        lines.append(f"file {os.path.basename(bpy.data.filepath) or '(unsaved)'} | engine {r.engine} | frames "
+                     f"{sc.frame_start}-{sc.frame_end} @{sc.frame_current} | {r.resolution_x}x{r.resolution_y} "
+                     f"{r.resolution_percentage}% | camera {sc.camera.name if sc.camera else '-'} | hdri {env or '-'} "
+                     f"| unit scale {sc.unit_settings.scale_length:g}")
+    if req.get("root"):
+        root = bpy.data.objects.get(req["root"])
+        if root is None:
+            raise ValueError(f"no object named {req['root']!r}")
+        obs = [root] + list(root.children_recursive)
+    elif req.get("query"):
+        q = str(req["query"]).lower()
+        obs = [o for o in sc.objects if q in o.name.lower()]
+    else:
+        obs = [o for o in sc.objects if o.parent is None]
+    obs.sort(key=lambda o: o.name)
+    obj_fields = [f for f in fields if f != "settings"]
+    lines.append(f"showing {min(len(obs), limit)} of {len(obs)}")
+    for o in obs[:limit]:
+        lines.append(_obj_line(o, obj_fields))
+    return {"text": "\n".join(lines)}
+
+
+# ---------------------------------------------------------------- asset libraries (search + import)
+# Network work (API calls, downloads, unzip) runs in the connection thread BEFORE the job is queued
+# (_assets_net): Blender's main thread, the window and the other agents never wait on the internet.
+# Only the bpy part (preview sheet, import, material) runs as the queued command (cmd_assets).
+ASSET_UA = {"User-Agent": "blender-hub"}
+ASSET_SOURCES = ("polyhaven", "sketchfab", "polypizza")
+PH_TYPES = {"hdris": 0, "textures": 1, "models": 2}
+_SAFE_ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+_AUTH_HEADERS = ("Authorization", "X-auth-token")
+ZIP_MAX_BYTES = 2 * 1024 ** 3
+
+
+def _check_id(v, what="asset_id"):
+    v = str(v or "")
+    if not _SAFE_ID.match(v):
+        raise ValueError(f"{what} must be letters, digits, _ or - (got {v[:40]!r})")
+    return v
+
+
+def _opener():
+    import urllib.request
+    import urllib.parse
+
+    class _Redirect(urllib.request.HTTPRedirectHandler):
+        """https only; an API key never follows a redirect to another host."""
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            if urllib.parse.urlparse(newurl).scheme != "https":
+                raise ValueError(f"refusing a non-https redirect: {newurl[:80]}")
+            new = super().redirect_request(req, fp, code, msg, headers, newurl)
+            if new is not None and urllib.parse.urlparse(newurl).netloc != urllib.parse.urlparse(req.full_url).netloc:
+                for h in _AUTH_HEADERS:
+                    new.remove_header(h)
+            return new
+    return urllib.request.build_opener(_Redirect)
+
+
+def _https(url):
+    import urllib.parse
+    if urllib.parse.urlparse(str(url)).scheme != "https":
+        raise ValueError(f"refusing a non-https url: {str(url)[:80]}")
+    return str(url)
+
+
+def _http_json(url, headers=None, timeout=30):
+    import urllib.request
+    rq = urllib.request.Request(_https(url), headers={**ASSET_UA, **(headers or {})})
+    with _opener().open(rq, timeout=timeout) as f:
+        return json.loads(f.read().decode("utf-8"))
+
+
+_PATH_LOCKS = {}
+
+
+def _path_lock(path):
+    """Downloads and unzips run in connection threads: two agents fetching the same asset take turns."""
+    with LOCK:
+        return _PATH_LOCKS.setdefault(os.path.normcase(os.path.abspath(path)), threading.Lock())
+
+
+def _http_file(url, path, headers=None, timeout=120):
+    import urllib.request
+    with _path_lock(path):
+        if os.path.isfile(path) and os.path.getsize(path) > 0:
+            return path  # cached (or just fetched by the other thread)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        rq = urllib.request.Request(_https(url), headers={**ASSET_UA, **(headers or {})})
+        tmp = path + ".part"
+        with _opener().open(rq, timeout=timeout) as f, open(tmp, "wb") as out:
+            shutil.copyfileobj(f, out)
+        os.replace(tmp, path)
+        return path
+
+
+def _asset_dir(*parts):
+    return os.path.join(ARGS["state"], "assets", *[_check_id(p, "path part") if i else p for i, p in enumerate(parts)])
+
+
+def _safe_join(base, rel):
+    """A relative path from an API response or a zip, kept inside `base`."""
+    rel = str(rel).replace("\\", "/")
+    if rel.startswith("/") or re.match(r"^[A-Za-z]:", rel) or any(p in ("..", "") for p in rel.split("/")):
+        raise ValueError(f"unsafe path from the download: {rel[:80]!r}")
+    p = os.path.realpath(os.path.join(base, *rel.split("/")))
+    root_ = os.path.realpath(base)
+    if os.path.commonpath([root_, p]) != root_:
+        raise ValueError(f"unsafe path from the download: {rel[:80]!r}")
+    return p
+
+
+def _extract_zip(z, ex):
+    """Extract into ex.part, check every member and the total size first, then rename: never a half model."""
+    with _path_lock(ex):
+        return _extract_zip_locked(z, ex)
+
+
+def _extract_zip_locked(z, ex):
+    import zipfile
+    if os.path.isdir(ex):
+        return ex
+    part = ex + ".part"
+    shutil.rmtree(part, ignore_errors=True)
+    with zipfile.ZipFile(z) as zf:
+        total = 0
+        for info in zf.infolist():
+            if not info.is_dir():
+                _safe_join(part, info.filename)
+            total += info.file_size
+        if total > ZIP_MAX_BYTES:
+            raise ValueError(f"download unpacks to {total // 1024 ** 2} MB (limit {ZIP_MAX_BYTES // 1024 ** 2} MB)")
+        zf.extractall(part)
+    os.replace(part, ex)
+    return ex
+
+
+def _key(env):
+    k = os.environ.get(env)
+    if not k:
+        raise PermissionError(f"this source needs an API key: set {env} in the hub's environment (MCP server env)")
+    return k
+
+
+def _limit(req):
+    return min(max(int(req.get("limit") or 10), 1), 24)
+
+
+def _ph_search(req):
+    t = str(req.get("type") or "all").lower()
+    if t != "all" and t not in PH_TYPES:
+        raise ValueError("type must be hdris, textures, models or all")
+    data = _http_json("https://api.polyhaven.com/assets" + ("" if t == "all" else f"?t={t}"))
+    words = [w for w in re.split(r"\W+", str(req.get("query") or "").lower()) if w]
+    cat = str(req.get("category") or "").lower()
+    min_m = float(req.get("min_size_m") or 0)
+    hits = []
+    for aid, a in data.items():
+        cats = [c.lower() for c in a.get("categories", [])]
+        tags = [x.lower() for x in a.get("tags", [])]
+        name = a.get("name", aid).lower()
+        if cat and not any(cat in c for c in cats):
+            continue
+        dims = a.get("dimensions")
+        size_m = round(max(dims) / 1000.0, 2) if dims else None
+        if min_m and (size_m is None or size_m < min_m):
+            continue
+        score = sum(3 * (w in name) + 2 * any(w in x for x in tags) + any(w in c for c in cats) for w in words)
+        if words and score == 0:
+            continue
+        hits.append((score, a.get("download_count", 0), aid, a, size_m))
+    hits.sort(key=lambda h: (-h[0], -h[1]))
+    inv = {v: k for k, v in PH_TYPES.items()}
+    out = []
+    for _s, _d, aid, a, size_m in hits[:_limit(req)]:
+        row = {"id": aid, "name": a.get("name"), "type": inv.get(a.get("type")), "categories": a.get("categories", [])[:3]}
+        if size_m:
+            row["size_m"] = size_m
+        if a.get("polycount"):
+            row["polys"] = a["polycount"]
+        row["thumb"] = f"https://cdn.polyhaven.com/asset_img/thumbs/{aid}.png?width=256&height=256"
+        out.append(row)
+    return out
+
+
+def _sf_search(req):
+    import urllib.parse
+    lic = {"CC0": "cc0", "CC-BY": "by"}.get(str(req.get("licence") or "").upper())
+    if req.get("licence") and not lic:
+        raise ValueError("licence must be CC0 or CC-BY")
+    q = urllib.parse.urlencode({k: v for k, v in {"type": "models", "q": req.get("query") or "", "downloadable": "true",
+                                                    "count": _limit(req), "categories": req.get("category"),
+                                                    "license": lic,
+                                                    "animated": "true" if req.get("animated") else None}.items() if v})
+    data = _http_json("https://api.sketchfab.com/v3/search?" + q)
+    out = []
+    for m in data.get("results", [])[:_limit(req)]:
+        imgs = sorted((m.get("thumbnails") or {}).get("images", []), key=lambda i: abs((i.get("width") or 0) - 256))
+        lic_ = m.get("license")
+        out.append({"id": m.get("uid"), "name": m.get("name"), "author": (m.get("user") or {}).get("username"),
+                    "license": lic_.get("label") if isinstance(lic_, dict) else lic_, "faces": m.get("faceCount"),
+                    "animated": bool(m.get("animationCount")), "thumb": imgs[0]["url"] if imgs else None})
+    return out
+
+
+def _pp_search(req):
+    import urllib.parse
+    key = _key("POLYPIZZA_API_KEY")
+    params = {k: v for k, v in {"Limit": _limit(req), "Category": req.get("category"),
+                                "License": {"CC0": 1, "CC-BY": 0}.get(str(req.get("licence") or "").upper()),
+                                "Animated": "true" if req.get("animated") else None}.items() if v is not None}
+    data = _http_json("https://api.poly.pizza/v1.1/search/" + urllib.parse.quote(str(req.get("query") or ""))
+                      + "?" + urllib.parse.urlencode(params), {"x-auth-token": key})
+    out = []
+    for m in (data.get("results") or [])[:_limit(req)]:
+        out.append({"id": m.get("ID"), "name": m.get("Title"), "author": (m.get("Creator") or {}).get("Username"),
+                    "license": m.get("Licence"), "tris": m.get("Tri Count"), "animated": bool(m.get("Animated")),
+                    "thumb": m.get("Thumbnail")})
+    return out
+
+
+def _fetch_thumbs(src, rows, n):
+    """Thumbnail files of the first n results, cached per asset (reused by later searches)."""
+    paths = []
+    for row in rows[:min(max(n, 0), 6)]:
+        url, rid = row.get("thumb"), str(row.get("id") or "")
+        if not url or not _SAFE_ID.match(rid):
+            continue
+        ext = os.path.splitext(url.split("?")[0])[1].lower()
+        p = os.path.join(_asset_dir("thumbs", src), rid + (ext if ext in (".png", ".jpg", ".jpeg", ".webp") else ".png"))
+        with contextlib.suppress(Exception):
+            paths.append(_http_file(url, p, timeout=30))
+    return paths
+
+
+def _preview_sheet(paths, tag):
+    """One image with the thumbnails, each letterboxed into a 256 px tile (no distortion)."""
+    if np is None or not paths:
+        return None
+    tiles = []
+    for p in paths:
+        img = None
+        try:
+            img = bpy.data.images.load(p, check_existing=False)
+            img.colorspace_settings.is_data = True
+            w, h = img.size
+            if not w or not h:
+                continue
+            f = 256.0 / max(w, h)
+            nw, nh = max(1, round(w * f)), max(1, round(h * f))
+            img.scale(nw, nh)
+            px = np.empty(nw * nh * 4, dtype=np.float32)
+            img.pixels.foreach_get(px)
+            tile = np.zeros((256, 256, 4), dtype=np.float32)
+            tile[..., 3] = 1.0
+            y0, x0 = (256 - nh) // 2, (256 - nw) // 2
+            tile[y0:y0 + nh, x0:x0 + nw] = px.reshape(nh, nw, 4)
+            tiles.append(tile)
+        except Exception:
+            continue
+        finally:
+            if img is not None:
+                with contextlib.suppress(Exception):
+                    bpy.data.images.remove(img)
+    if not tiles:
+        return None
+    cols = min(3, len(tiles))
+    rws = math.ceil(len(tiles) / cols)
+    grid = np.zeros((rws * 256, cols * 256, 4), dtype=np.float32)
+    for i, t in enumerate(tiles):
+        r_, c_ = divmod(i, cols)
+        grid[(rws - 1 - r_) * 256:(rws - r_) * 256, c_ * 256:(c_ + 1) * 256] = t
+    out_dir = os.path.join(ARGS["state"], "renders", ARGS["name"])
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, f"assets_{tag}.png")
+    im = bpy.data.images.new(f"hub_prev_{tag}", cols * 256, rws * 256, alpha=True)
+    try:
+        im.colorspace_settings.is_data = True
+        im.pixels.foreach_set(grid.ravel())
+        im.filepath_raw = path
+        im.file_format = "PNG"
+        im.save()
+    finally:
+        bpy.data.images.remove(im)
+    return path
+
+
+def _ph_net(req, exclusive):
+    aid = _check_id(req.get("asset_id"))
+    res = _check_id(req.get("resolution") or "2k", "resolution")
+    t = str(req.get("type") or "").lower()
+    if not t:  # not given: ask Poly Haven what it is
+        code = _http_json(f"https://api.polyhaven.com/info/{aid}").get("type")
+        t = {v: k for k, v in PH_TYPES.items()}.get(code, "")
+    if t not in PH_TYPES:
+        raise ValueError("polyhaven type must be hdris, textures or models")
+    if t == "hdris" and not exclusive:
+        raise PermissionError("an HDRI replaces the world lighting for everyone: needs an exclusive lease")
+    files = _http_json(f"https://api.polyhaven.com/files/{aid}")
+    att = {"source": "polyhaven", "id": aid, "license": "CC0"}
+    if t == "models":
+        g = (files.get("gltf") or {}).get(res) or next(iter((files.get("gltf") or {}).values()), None)
+        if not g:
+            raise ValueError(f"{aid}: no glTF download")
+        main = g["gltf"]
+        d = _asset_dir("polyhaven", aid, res)
+        path = _http_file(main["url"], _safe_join(d, os.path.basename(main["url"].split("?")[0])))
+        for rel, inc in (main.get("include") or {}).items():
+            _http_file(inc["url"], _safe_join(d, rel))
+        return {"kind": "model", "path": path, "att": att}
+    if t == "hdris":
+        fmt = _check_id(req.get("file_format") or "hdr", "file_format")
+        h = ((files.get("hdri") or {}).get(res) or {}).get(fmt)
+        if not h:
+            raise ValueError(f"{aid}: no {res} {fmt} HDRI")
+        p = _http_file(h["url"], _safe_join(_asset_dir("polyhaven", aid), os.path.basename(h["url"].split("?")[0])))
+        return {"kind": "hdri", "path": p, "att": att}
+    fmt = _check_id(req.get("file_format") or "jpg", "file_format")
+    maps = {}
+    for key in ("Diffuse", "nor_gl", "Rough", "Metal", "arm"):  # only the maps the material uses
+        if key == "arm" and "Rough" in maps:
+            continue
+        m = ((files.get(key) or {}).get(res) or {}).get(fmt)
+        if m:
+            maps[key] = _http_file(m["url"], _safe_join(_asset_dir("polyhaven", aid, res),
+                                                        os.path.basename(m["url"].split("?")[0])))
+    if "Diffuse" not in maps:
+        raise ValueError(f"{aid}: no {res} {fmt} texture maps")
+    return {"kind": "texture", "maps": maps, "att": att}
+
+
+def _sf_net(req):
+    uid = _check_id(req.get("asset_id"))
+    if not req.get("target_size"):
+        raise ValueError("sketchfab models come at arbitrary scale: pass target_size (metres of the largest side)")
+    key = _key("SKETCHFAB_API_KEY")
+    meta = _http_json(f"https://api.sketchfab.com/v3/models/{uid}")
+    dl = _http_json(f"https://api.sketchfab.com/v3/models/{uid}/download", {"Authorization": f"Token {key}"})
+    url = (dl.get("gltf") or {}).get("url")
+    if not url:
+        raise ValueError(f"{uid}: no glTF download (not downloadable with this account?)")
+    d = _asset_dir("sketchfab", uid)
+    z = _http_file(url, os.path.join(d, "model.zip"), timeout=300)
+    ex = _extract_zip(z, os.path.join(d, "x"))
+    gl = next((os.path.join(a, f) for a, _b, fs in os.walk(ex) for f in sorted(fs) if f.lower().endswith((".gltf", ".glb"))), None)
+    if not gl:
+        raise ValueError(f"{uid}: no glTF in the download")
+    lic = meta.get("license")
+    att = {"source": "sketchfab", "id": uid, "author": (meta.get("user") or {}).get("username"),
+           "license": lic.get("label") if isinstance(lic, dict) else lic, "url": meta.get("viewerUrl")}
+    return {"kind": "model", "path": gl, "att": att}
+
+
+def _pp_net(req):
+    key = _key("POLYPIZZA_API_KEY")
+    mid = _check_id(req.get("asset_id"))
+    m = _http_json(f"https://api.poly.pizza/v1.1/model/{mid}", {"x-auth-token": key})
+    url = m.get("Download")
+    if not url:
+        raise ValueError(f"{mid}: no download url")
+    name = os.path.basename(url.split("?")[0]) or "model.glb"
+    if not name.lower().endswith((".glb", ".gltf")):
+        name = "model.glb"
+    p = _http_file(url, _safe_join(_asset_dir("polypizza", mid), name))
+    att = {"source": "polypizza", "id": mid, "author": (m.get("Creator") or {}).get("Username"),
+           "license": m.get("Licence")}
+    return {"kind": "model", "path": p, "att": att}
+
+
+def _assets_net(req):
+    """Connection thread, before queuing: everything that waits on the internet. No bpy here."""
+    action = str(req.get("action") or "search").lower()
+    src = str(req.get("source") or "polyhaven").lower()
+    if src not in ASSET_SOURCES:
+        raise ValueError("source must be " + ", ".join(ASSET_SOURCES))
+    if action == "search":
+        rows = {"polyhaven": _ph_search, "sketchfab": _sf_search, "polypizza": _pp_search}[src](req)
+        thumbs = _fetch_thumbs(src, rows, int(req.get("previews") or 0))
+        return {"rows": rows, "thumbs": thumbs}
+    if action != "import":
+        raise ValueError("action must be search or import")
+    with LOCK:
+        exclusive = PARTS.get(req.get("token"), {}).get("mode") == "exclusive"
+    if src == "polyhaven":
+        return _ph_net(req, exclusive)
+    return _sf_net(req) if src == "sketchfab" else _pp_net(req)
+
+
+def _activate_agent_coll(agent):
+    coll = _agent_coll(agent)
+    vl = bpy.context.view_layer
+
+    def find_lc(lc):
+        if lc.collection == coll:
+            return lc
+        for ch in lc.children:
+            r_ = find_lc(ch)
+            if r_:
+                return r_
+    lc = find_lc(vl.layer_collection)
+    if lc:
+        if lc.exclude:
+            lc.exclude = False
+        vl.active_layer_collection = lc
+    return coll
+
+
+def _import_model(path, coll, target_size, attribution):
+    before = set(bpy.data.objects)
+    ext = os.path.splitext(path)[1].lower()
+    if ext not in (".gltf", ".glb"):
+        raise ValueError(f"unsupported model file: {path}")
+    bpy.ops.import_scene.gltf(filepath=path)
+    new = [o for o in bpy.data.objects if o not in before]
+    for o in new:  # always in the agent's collection, whatever the importer did
+        if o.name not in coll.objects:
+            coll.objects.link(o)
+        for c in list(o.users_collection):
+            if c != coll:
+                c.objects.unlink(o)
+        for k, v in attribution.items():
+            o[f"asset_{k}"] = str(v)
+    roots = [o for o in new if o.parent is None or o.parent not in new]
+    meshes = [o for o in new if o.type in MESH_TYPES]
+    if target_size and meshes:
+        bpy.context.view_layer.update()
+        lo, hi = _bbox(meshes)
+        big = max(hi - lo)
+        if big > 1e-9:
+            f = float(target_size) / big
+            for o in roots:
+                o.scale = o.scale * f
+                o.location = o.location * f
+    bpy.context.view_layer.update()
+    lo, hi = _bbox(meshes) if meshes else (mathutils.Vector(), mathutils.Vector())
+    return {"objects": sorted(o.name for o in new), "size_m": [round(v, 3) for v in (hi - lo)],
+            "min_z": round(lo.z, 3), **attribution}
+
+
+def _texture_material(net, req, coll, exclusive):
+    # validate every target before changing anything (no partial application)
+    targets = []
+    for name in req.get("apply_to") or []:
+        ob = bpy.data.objects.get(name)
+        if ob is None:
+            raise ValueError(f"no object named {name!r}")
+        if ob.type not in MESH_TYPES or ob.data is None or not hasattr(ob.data, "materials"):
+            raise ValueError(f"{name} cannot take a material ({ob.type})")
+        if not exclusive:
+            if ob.name not in coll.all_objects:
+                raise PermissionError(f"{name} is not in your collection {coll.name}")
+            sharing = [o.name for o in bpy.data.objects if o.data == ob.data and o.name not in coll.all_objects]
+            if sharing:
+                raise PermissionError(f"{name}'s mesh is shared with objects outside your collection: {sharing[:5]}")
+        targets.append(ob)
+    maps = net["maps"]
+    mat = bpy.data.materials.new(f"PH_{net['att']['id']}")
+    if mat.node_tree is None and hasattr(mat, "use_nodes"):
+        mat.use_nodes = True
+    nt = mat.node_tree
+    bsdf = nt.nodes.get("Principled BSDF")
+
+    def tex(key, color):
+        n = nt.nodes.new("ShaderNodeTexImage")
+        n.image = bpy.data.images.load(maps[key], check_existing=True)
+        if not color:
+            n.image.colorspace_settings.is_data = True
+        return n
+    nt.links.new(tex("Diffuse", True).outputs["Color"], bsdf.inputs["Base Color"])
+    if "Rough" in maps:
+        nt.links.new(tex("Rough", False).outputs["Color"], bsdf.inputs["Roughness"])
+    elif "arm" in maps:  # AO / Roughness / Metal packed in R / G / B
+        sep = nt.nodes.new("ShaderNodeSeparateColor")
+        nt.links.new(tex("arm", False).outputs["Color"], sep.inputs["Color"])
+        nt.links.new(sep.outputs[1], bsdf.inputs["Roughness"])
+        if "Metal" not in maps:
+            nt.links.new(sep.outputs[2], bsdf.inputs["Metallic"])
+    if "Metal" in maps:
+        nt.links.new(tex("Metal", False).outputs["Color"], bsdf.inputs["Metallic"])
+    if "nor_gl" in maps:
+        nm = nt.nodes.new("ShaderNodeNormalMap")
+        nt.links.new(tex("nor_gl", False).outputs["Color"], nm.inputs["Color"])
+        nt.links.new(nm.outputs["Normal"], bsdf.inputs["Normal"])
+    for ob in targets:
+        ob.data.materials.clear()
+        ob.data.materials.append(mat)
+    return {"material": mat.name, "applied_to": [o.name for o in targets], "maps": sorted(maps), **net["att"]}
+
+
+def cmd_assets(req):
+    """bpy part of hub_assets (the network part already ran in the connection thread, see _assets_net)."""
+    if req.get("_net_exc") is not None:
+        raise req["_net_exc"]
+    net = req.get("_net") or {}
+    action = str(req.get("action") or "search").lower()
+    if action == "search":
+        out = {"results": net.get("rows", [])}
+        sheet = _preview_sheet(net.get("thumbs") or [], f"{req.get('source', 'x')}_{int(time.time() * 1000)}")
+        if sheet:
+            out["sheet"] = sheet
+        for row in out["results"]:
+            row.pop("thumb", None)  # urls cost tokens; the previews show them
+        return out
+    with LOCK:
+        exclusive = PARTS.get(req["token"], {}).get("mode") == "exclusive"
+    vl = bpy.context.view_layer
+    sel = {o.name for o in vl.objects if o.select_get()}
+    active, active_lc = vl.objects.active, vl.active_layer_collection
+    try:
+        if net.get("kind") == "hdri":
+            if not exclusive:
+                raise PermissionError("an HDRI replaces the world lighting for everyone: needs an exclusive lease")
+            w = bpy.data.worlds.new(f"PH_{net['att']['id']}")
+            if w.node_tree is None and hasattr(w, "use_nodes"):
+                w.use_nodes = True
+            nt = w.node_tree
+            env = nt.nodes.new("ShaderNodeTexEnvironment")
+            env.image = bpy.data.images.load(net["path"], check_existing=True)
+            nt.links.new(env.outputs["Color"], nt.nodes["Background"].inputs["Color"])
+            bpy.context.scene.world = w
+            return {"world": w.name, **net["att"]}
+        coll = _activate_agent_coll(req["_agent"])
+        if net.get("kind") == "texture":
+            return _texture_material(net, req, coll, exclusive)
+        return _import_model(net["path"], coll, req.get("target_size"), net["att"])
+    finally:  # importers change selection, the active object and the active collection: give them back
+        for o in vl.objects:
+            with contextlib.suppress(Exception):
+                o.select_set(o.name in sel)
+        with contextlib.suppress(Exception):
+            vl.objects.active = active
+        with contextlib.suppress(Exception):
+            vl.active_layer_collection = active_lc
 
 
 def _require_owner_coll(req, name):
@@ -1536,8 +2493,8 @@ def cmd_quit(req):
 
 
 CMDS = {k[4:]: v for k, v in list(globals().items()) if k.startswith("cmd_")}
-TOUCHES_SCENE = {"exec", "claim", "merge"}
-NEEDS_AGENT = {"exec", "claim", "turntable", "export_collection", "note"}
+TOUCHES_SCENE = {"exec", "claim", "merge", "assets"}
+NEEDS_AGENT = {"exec", "claim", "turntable", "export_collection", "note", "assets"}
 
 
 def dispatch(req):
@@ -1562,13 +2519,14 @@ def dispatch(req):
                 extra["warning"] = warn
     with LOCK:
         exclusive = PARTS.get(token, {}).get("mode") == "exclusive"
-    if cmd in TOUCHES_SCENE or cmd in {"measure", "turntable", "export_collection", "save", "view"}:
+    touches = cmd in TOUCHES_SCENE and not (cmd == "assets" and str(req.get("action") or "search") != "import")
+    if touches or cmd in {"measure", "turntable", "export_collection", "save", "view"}:
         warn = _ensure_object_mode()
         if warn:
             extra["warning"] = (extra.get("warning", "") + " | " if extra.get("warning") else "") + warn
     if cmd == "exec":  # (re)load modules BEFORE the ownership snapshot: their import is nobody's change
         _load_modules(req.get("_agent"))
-    before = _snapshot(req.get("_agent"), exclusive) if cmd in TOUCHES_SCENE else None
+    before = _snapshot(req.get("_agent"), exclusive) if touches else None
     own_before = None
     if cmd in ("exec", "claim"):
         try:
@@ -1687,6 +2645,11 @@ def _client(conn):
                 with LOCK:
                     if tok:
                         PENDING[tok] = PENDING.get(tok, 0) + 1  # queued: does not expire
+                if req.get("cmd") == "assets" and _check_token_net(req)["live"]:  # internet work here, not on the main thread
+                    try:
+                        req["_net"] = _assets_net(req)
+                    except Exception as e:  # raised by the queued command, after the token/agent checks
+                        req["_net_exc"] = e
                 box = queue.Queue(1)
                 JOBS.put((req, box, time.perf_counter()))
                 resp = box.get()

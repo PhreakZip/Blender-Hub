@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.13.0 — 2026-11-20
+Everything the standard Blender MCP addon offers, except AI generation (out of scope):
+- `hub_turntable`: new `shading` modes `xray`, `wireframe` (wire copies of the evaluated meshes; originals only hidden from the render) and `cycles` (16 samples + denoise, the hub's light rig); `camera="scene"` renders through the scene camera with the render aspect; `timeline` (a count or a list of frames) makes an animation strip from one fixed view framing the whole motion, restoring the current frame, subframe and unkeyed edits of animated properties; it refuses scenes with unbaked simulations unless `force=true`. Workbench sheets get a temporary world when the scene has none (it was blank). The scene camera and timelines never reuse a sheet.
+- `hub_screenshot`: `shading` for one capture (the user's viewport shading is restored) and `image` (`"Render Result"`, an image in the file or a file path; no window needed).
+- New `hub_scene`: scene facts as text — location, world size, on ground / floating / below, rotation, scale, hierarchy, visibility, faces/bones/light power, materials, modifiers, animation, topology health (quads, tris, ngons, non-manifold, boundary, loose, poles), skin weights, and a scene settings line.
+- New `hub_assets`: search and import from Poly Haven (CC0, no key), Sketchfab (search keyless, import with `SKETCHFAB_API_KEY`) and Poly Pizza (`POLYPIZZA_API_KEY`), with an optional thumbnail sheet. Imports land in the agent's collection with source, author and license as `asset_*` properties, scaled to `target_size`; textures build a PBR material on your own objects; HDRIs need an exclusive lease. Downloads are cached in the state folder.
+- Token economy: the `token`, `agent_key` and `note` parameters are explained once in the server instructions instead of in every tool. Tool definitions + instructions ~3,130 tokens for 23 tools (0.12.0: ~2,840 for 21); typical session ~11,260 (+2.6%), still −21% against the standard addon at the same quality.
+- 160-check suite (asset-library checks are reported as SKIPPED when offline).
+
 ## 0.12.0 — 2026-11-20
 - `hub_turntable(shading="rendered")`: the same contact sheet rendered with EEVEE (16 samples), so materials, emissive and light can be reviewed before export. Same image size as the Workbench sheet, so the same token cost (~1,100 for 12 views). With isolation (default) it uses the hub's fixed world and key/fill sun lights, so every review is lit the same way.
 - Reuse of an unchanged sheet works in rendered mode too, with a wider fingerprint (render, EEVEE incl. nested structs, view layer, display device, object visibility flags, texture space, pass index, object custom props). Materials that read images or other objects (Texture Coordinate object, non-geometry Attribute nodes) always re-render.

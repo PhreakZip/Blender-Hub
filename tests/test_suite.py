@@ -34,6 +34,8 @@ with open(MOD_BAD, "w", encoding="utf-8") as _f:
     _f.write("raise RuntimeError('broken on purpose')\n")
 os.environ["BLENDER_HUB_MODULES"] = f"KT={MOD_OK};{MOD_BAD};bad-name={MOD_OK};np={MOD_OK}"
 os.environ.setdefault("BLENDER_HUB_IDLE", "600")
+for _k in ("SKETCHFAB_API_KEY", "POLYPIZZA_API_KEY"):  # the suite checks the no-key errors
+    os.environ.pop(_k, None)
 import hub as hubmod  # noqa: E402
 from hub import Hub, free_mb  # noqa: E402
 
@@ -645,7 +647,7 @@ result = (sc.render.engine, w0.name if w0 else None, sc.eevee.taa_render_samples
     rd3 = res(H.call(W1, "turntable", objects=["glow"], **rd_args), "rendered 3")
     tx1 = res(H.call(W1, "turntable", objects=["texd"], **rd_args), "rendered tex 1")
     tx2 = res(H.call(W1, "turntable", objects=["texd"], **rd_args), "rendered tex 2")
-    bad = H.call(W1, "turntable", objects=["glow"], token=a, agent="A", agent_key=KEYS.get("A"), views=4, shading="cycles")
+    bad = H.call(W1, "turntable", objects=["glow"], token=a, agent="A", agent_key=KEYS.get("A"), views=4, shading="pathtracer")
     check("turntable shading=rendered: EEVEE sheet; repeat reuses; solid is a separate review; emission change renders; image textures never reuse; bad shading refused",
           rd1 and rd1.get("shading") == "rendered" and rd1.get("sheet") and os.path.exists(rd1["sheet"])
           and rd2 and rd2.get("unchanged") and sol and not sol.get("unchanged") and rd2b and rd2b.get("unchanged")
@@ -671,6 +673,207 @@ result = (stats(r'{rd1['sheet'] if rd1 else ''}'), stats(r'{rd3['sheet'] if rd3 
         exp[4] = not exp[4]  # the compositing flip above was left flipped on purpose
     check("rendered sheet shows the emissive glow (red >> green) and not after emission is off; engine/world/samples/look restored, no rig left",
           rr and rr[0] > 0.2 and rr[1] < 0.05 and rr[2] == exp and rr[3] == [], (rr, exp))
+    # ================= 0.13.0: xray / wireframe / cycles, scene camera, timeline strip, image capture, scene facts, assets
+    res(ex(W1, a, "A", """
+sc = bpy.context.scene
+bpy.ops.mesh.primitive_monkey_add(location=(0, -100, 0)); o = bpy.context.object; o.name = 'mover'
+o.keyframe_insert('location', frame=1); o.location.x = 3; o.keyframe_insert('location', frame=20); o.location.x = 0
+o["ik"] = 0.0; o.keyframe_insert('["ik"]', frame=1); o["ik"] = 1.0; o.keyframe_insert('["ik"]', frame=20)
+bpy.ops.mesh.primitive_cube_add(location=(0, -104, 0)); n_ = bpy.context.object; n_.name = 'nla_only'
+n_.keyframe_insert('location', frame=1); n_.location.y = -110; n_.keyframe_insert('location', frame=20)
+act = n_.animation_data.action; tr = n_.animation_data.nla_tracks.new(); tr.strips.new('s', 1, act); n_.animation_data.action = None
+sc.frame_start, sc.frame_end = 1, 20; sc.frame_set(5, subframe=0.5)
+cd = bpy.data.cameras.new('scam'); c = bpy.data.objects.new('scam', cd); coll.objects.link(c)
+c.location = (1.5, -109, 0.5); c.rotation_euler = (1.5708, 0, 0)
+sc.camera = None
+result = 1
+"""), "mover + camera")
+    st0 = res(ex(W1, a, "A", "sc = bpy.context.scene; result = (sc.frame_current, round(sc.frame_subframe, 3), "
+                             "sc.display.shading.show_xray, sc.cycles.samples, len(bpy.data.meshes), sc.render.engine)"), "state before")
+    m_args = dict(token=a, agent="A", objects=["mover"], size=128)
+    sx = {sh: res(H.call(W1, "turntable", views=4, shading=sh, **m_args), sh) for sh in ("xray", "wireframe", "cycles")}
+    nocam = H.call(W1, "turntable", camera="scene", agent_key=KEYS.get("A"), **m_args)
+    res(ex(W1, a, "A", "bpy.context.scene.camera = bpy.data.objects['scam']; bpy.context.scene.render.resolution_x, "
+                       "bpy.context.scene.render.resolution_y = 1920, 1080; result = 1"), "set scene camera")
+    cam1 = res(H.call(W1, "turntable", camera="scene", **m_args), "scene camera")
+    res(ex(W1, a, "A", "bpy.data.objects['mover'].location.z = 0.77; result = 1"), "unkeyed edit")  # z has no fcurve
+    res(ex(W1, a, "A", "bpy.data.objects['mover'].location.x = 7.0; bpy.data.objects['mover']['ik'] = 0.42; "
+                       "bpy.data.objects['nla_only'].location.z = 3.5; result = 1"), "unkeyed edits on keyed / custom / NLA props")
+    tl1 = res(H.call(W1, "turntable", timeline=5, **m_args), "timeline 1")
+    tl2 = res(H.call(W1, "turntable", timeline=5, **m_args), "timeline 2")
+    tll = res(H.call(W1, "turntable", timeline=[1, 10, 20], camera="scene", **m_args), "timeline list scene cam")
+    st1 = res(ex(W1, a, "A", f"""
+sc = bpy.context.scene
+img = bpy.data.images.load(r'{cam1['sheet'] if cam1 else ''}', check_existing=False); dims = tuple(img.size); bpy.data.images.remove(img)
+left = [o.name for o in bpy.data.objects if o.name.startswith(('hub_wire_', 'hub_cam_', 'hub_key_', 'hub_fill_'))]
+mv = bpy.data.objects['mover']
+extra = (round(mv['ik'], 3), round(bpy.data.objects['nla_only'].location.z, 3))
+result = ((sc.frame_current, round(sc.frame_subframe, 3), sc.display.shading.show_xray, sc.cycles.samples,
+           len(bpy.data.meshes), sc.render.engine), dims, left, (round(mv.location.x, 3), round(mv.location.z, 3)) + extra)
+"""), "state after")
+    check("turntable xray/wireframe/cycles render; scene camera keeps the render aspect; scene restored (frame+subframe, xray, samples, no wire meshes or rig left, unkeyed edits kept after a timeline, custom-property and NLA-only animation included)",
+          all(v and v.get("sheet") and v.get("shading") == k for k, v in sx.items()) and not nocam["ok"]
+          and "no camera" in (nocam.get("error") or "") and st0 and st1 and list(st1["result"][0]) == list(st0["result"])
+          and list(st1["result"][1]) == [128, 72] and st1["result"][2] == [] and list(st1["result"][3]) == [7.0, 0.77, 0.42, 3.5],
+          ({k: bool(v and v.get("sheet")) for k, v in sx.items()}, nocam.get("error"), st0 and st0["result"], st1 and st1["result"]))
+    check("timeline: N frames over the range (one view each), never reused; explicit list with the scene camera",
+          tl1 and tl1.get("timeline") == [1, 6, 10, 15, 20] and tl1.get("views") == 5 and tl2 and not tl2.get("unchanged")
+          and tll and tll.get("timeline") == [1, 10, 20] and tll.get("camera") == "scene",
+          (tl1 and tl1.get("timeline"), tl2 and tl2.get("unchanged"), tll and tll.get("timeline")))
+    res(ex(W1, a, "A", "bpy.ops.mesh.primitive_plane_add(location=(0, -95, 2)); c_ = bpy.context.object; c_.name = 'clothy'; "
+                       "c_.modifiers.new('cloth', 'CLOTH'); result = 1"), "unbaked cloth")
+    sim_no = H.call(W1, "turntable", timeline=3, agent_key=KEYS.get("A"), **m_args)
+    sim_yes = res(H.call(W1, "turntable", timeline=3, force=True, **m_args), "timeline force with sim")
+    res(ex(W1, a, "A", "bpy.data.objects.remove(bpy.data.objects['clothy']); result = 1"), "remove cloth")
+    check("timeline refuses to reset an unbaked simulation (names it) unless force=true, which warns",
+          not sim_no["ok"] and "clothy: cloth" in sim_no["error"] and sim_yes and "clothy" in (sim_yes.get("warning") or ""),
+          (sim_no.get("error"), sim_yes and sim_yes.get("warning")))
+    no_tok = H.call(W1, "assets", token="not-a-token", agent="A", agent_key=KEYS.get("A"), action="import",
+                    source="polyhaven", type="models", asset_id="never_cached_asset_x")
+    no_dir = not os.path.exists(os.path.join(os.environ["BLENDER_HUB_STATE"], "assets", "polyhaven", "never_cached_asset_x"))
+    check("assets: a request without a live lease is refused before any network work",
+          not no_tok["ok"] and "lease" in no_tok["error"] and "HTTP" not in no_tok["error"] and no_dir, (no_tok.get("error"), no_dir))
+    res(ex(W1, a, "A", "bpy.ops.render.render(); result = 1"), "render for Render Result")
+    shot_rr = H.call(W1, "screenshot", token=a, image="Render Result", size=256)
+    shot_f = H.call(W1, "screenshot", token=a, image=(cam1 or {}).get("sheet", ""), size=64)
+    shot_bad = H.call(W1, "screenshot", token=a, image="no_such_image_or_file")
+    check("screenshot image=: Render Result and a file work without a window, scaled to size; unknown image refused",
+          shot_rr["ok"] and shot_rr["result"]["area"] == "image" and max(shot_rr["result"]["size"]) <= 256
+          and os.path.exists(shot_rr["result"]["path"]) and shot_f["ok"] and shot_f["result"]["size"] == [128, 72]
+          and not shot_bad["ok"], (shot_rr.get("result") or shot_rr.get("error"), shot_f.get("error"), shot_bad.get("error")))
+    sc_r = H.call(W1, "scene", token=a, query="mover", fields=["location", "size", "ground", "details", "animation", "topology", "settings"])
+    sc_bad = H.call(W1, "scene", token=a, fields=["colour"])
+    txt = (sc_r.get("result") or {}).get("text", "")
+    check("hub_scene: header, settings line and per-object facts (faces, animation, topology); unknown field refused",
+          sc_r["ok"] and "mover [mesh]" in txt and "faces 500" in txt and "anim " in txt and "quads " in txt
+          and "engine " in txt and "frames 1-20" in txt and not sc_bad["ok"] and "unknown fields" in sc_bad["error"],
+          (txt[:400], sc_bad.get("error")))
+    # no world: Workbench sheets still get a background; wires visible on a 0.01-scale object; excluded objects in hub_scene
+    res(ex(W1, a, "A", """
+sc = bpy.context.scene
+import builtins; builtins._hub_w0 = sc.world; sc.world = None
+bpy.ops.mesh.primitive_cube_add(size=200, location=(0, -140, 0)); t = bpy.context.object; t.name = 'tiny'; t.scale = (0.01,) * 3
+ex_c = bpy.data.collections.new('excl_test'); coll.children.link(ex_c)
+o = bpy.data.objects.new('in_excluded', None); ex_c.objects.link(o)
+def find(lc):
+    if lc.collection == ex_c: return lc
+    for ch in lc.children:
+        r = find(ch)
+        if r: return r
+find(bpy.context.view_layer.layer_collection).exclude = True
+result = 1
+"""), "no world + tiny + excluded")
+    nw = res(H.call(W1, "turntable", token=a, agent="A", objects=["tiny"], views=1, size=128), "no-world sheet")
+    wf = res(H.call(W1, "turntable", token=a, agent="A", objects=["tiny"], views=1, size=128, shading="wireframe"), "tiny wire")
+    sc_ex = H.call(W1, "scene", token=a, query="in_excluded", fields=["hidden"])
+    px = res(ex(W1, a, "A", f"""
+def load(p):
+    img = bpy.data.images.load(p, check_existing=False)
+    a_ = np.empty(len(img.pixels), dtype=np.float32); img.pixels.foreach_get(a_); bpy.data.images.remove(img)
+    return a_.reshape(-1, 4)
+bg = load(r'{(nw or {}).get('sheet', '')}')
+wire = load(r'{(wf or {}).get('sheet', '')}')
+import builtins
+world_back = bpy.context.scene.world is None
+bpy.context.scene.world = builtins._hub_w0
+result = (round(float(bg[0, 3]), 2), round(float(bg[0, :3].mean()), 2), round(float(wire[:, :3].mean(axis=1).min()), 3), world_back)
+"""), "pixels")
+    check("no scene world: the Workbench sheet still has a background and the scene keeps no world; wires show on a 0.01-scale object; hub_scene says excluded",
+          px and px["result"][0] == 1.0 and px["result"][1] > 0.2 and px["result"][2] < 0.5 and px["result"][3] is True
+          and sc_ex["ok"] and "excluded" in sc_ex["result"]["text"], (px and px["result"], sc_ex.get("result") or sc_ex.get("error")))
+    # asset rules that need no network: missing keys, HDRI needs exclusive, ids are validated
+    sf = H.call(W1, "assets", token=a, agent="A", agent_key=KEYS.get("A"), action="import", source="sketchfab",
+                asset_id="abc", target_size=1)
+    pp = H.call(W1, "assets", token=a, agent="A", agent_key=KEYS.get("A"), action="search", source="polypizza", query="tree")
+    hd = H.call(W1, "assets", token=a, agent="A", agent_key=KEYS.get("A"), action="import", source="polyhaven",
+                type="hdris", asset_id="some_sky", resolution="1k")
+    bad_id = H.call(W1, "assets", token=a, agent="A", agent_key=KEYS.get("A"), action="import", source="polyhaven",
+                    type="models", asset_id="../../evil")
+    check("assets without network: missing API keys are named, HDRI needs an exclusive lease, unsafe ids are refused",
+          not sf["ok"] and "SKETCHFAB_API_KEY" in sf["error"] and not pp["ok"] and "POLYPIZZA_API_KEY" in pp["error"]
+          and not hd["ok"] and "exclusive" in hd["error"] and not bad_id["ok"] and "asset_id" in bad_id["error"],
+          (sf.get("error"), pp.get("error"), hd.get("error"), bad_id.get("error")))
+    zt = res(ex(W1, a, "A", r"""
+import gc, zipfile, os, tempfile
+fn = {f.__name__: f for f in gc.get_objects() if type(f).__name__ == 'function' and f.__name__ in ('_safe_join', '_extract_zip')}
+d = tempfile.mkdtemp()
+out = []
+for member in ('../evil.txt', '../x2/evil.txt', 'C:/evil.txt', 'ok/../../evil.txt'):
+    z = os.path.join(d, 'm.zip')
+    with zipfile.ZipFile(z, 'w') as zf:
+        zf.writestr('ok/a.txt', 'a'); zf.writestr(member, 'x')
+    try:
+        fn['_extract_zip'](z, os.path.join(d, 'x')); out.append('extracted')
+    except ValueError:
+        out.append('refused')
+with zipfile.ZipFile(os.path.join(d, 'g.zip'), 'w') as zf:
+    zf.writestr('ok/a.txt', 'a')
+fn['_extract_zip'](os.path.join(d, 'g.zip'), os.path.join(d, 'good'))
+out.append(os.path.isfile(os.path.join(d, 'good', 'ok', 'a.txt')) and not os.path.exists(os.path.join(d, 'good.part')))
+out.append(not os.path.exists(os.path.join(d, 'x')))
+result = out
+"""), "zip safety")
+    check("zip downloads: members escaping the folder (.., sibling prefix, absolute) are refused, nothing half-extracted is kept; a good zip extracts",
+          zt and zt["result"] == ["refused"] * 4 + [True, True], zt and zt["result"])
+    # asset libraries: network needed (skipped and reported, not failed, when offline)
+    try:
+        import urllib.request
+        urllib.request.urlopen(urllib.request.Request("https://api.polyhaven.com/types", headers={"User-Agent": "blender-hub"}), timeout=10)
+        online = True
+    except Exception:
+        online = False
+    if online:
+        srch = res(H.call(W1, "assets", token=a, agent="A", agent_key=KEYS.get("A"), action="search", source="polyhaven",
+                          query="brick", type="textures", limit=3, previews=2), "ph search")
+        imp = res(H.call(W1, "assets", token=a, agent="A", agent_key=KEYS.get("A"), action="import", source="polyhaven",
+                         type="textures", asset_id=((srch or {}).get("results") or [{}])[0].get("id", ""), resolution="1k",
+                         apply_to=["mover"]), "ph texture")
+        model = res(H.call(W1, "assets", token=a, agent="A", agent_key=KEYS.get("A"), action="import", source="polyhaven",
+                           type="models", asset_id="painted_wooden_chair_01", resolution="1k", target_size=1.0), "ph model")
+        res(ex(W1, b, "B", "bpy.ops.mesh.primitive_cube_add(location=(0, -160, 0)); bpy.context.object.name = 'b_owned'; result = 1"), "B cube")
+        res(ex(W1, a, "A", "o = bpy.data.objects.new('a_share', bpy.data.objects['b_owned'].data); coll.objects.link(o); result = 1"), "A shares B's mesh")
+        tex_id = ((srch or {}).get("results") or [{}])[0].get("id", "")
+        foreign = H.call(W1, "assets", token=a, agent="A", agent_key=KEYS.get("A"), action="import", source="polyhaven",
+                         type="textures", asset_id=tex_id, resolution="1k", apply_to=["mover", "b_owned"])
+        shared = H.call(W1, "assets", token=a, agent="A", agent_key=KEYS.get("A"), action="import", source="polyhaven",
+                        type="textures", asset_id=tex_id, resolution="1k", apply_to=["a_share"])
+        res(ex(W1, a, "A", "vl = bpy.context.view_layer; [o.select_set(o.name == 'mover') for o in vl.objects]; "
+                           "vl.objects.active = bpy.data.objects['mover']; result = 1"), "select mover")
+        untyped = H.call(W1, "assets", token=a, agent="A", agent_key=KEYS.get("A"), action="import", source="polyhaven",
+                         asset_id="painted_wooden_chair_01", resolution="1k", target_size=0.5)
+        import threading as _th
+        both = {}
+
+        def _imp(tok, ag):
+            both[ag] = Hub().call(W1, "assets", token=tok, agent=ag, agent_key=KEYS.get(ag), action="import",
+                                  source="polyhaven", type="models", asset_id="painted_wooden_chair_02", resolution="1k",
+                                  target_size=0.8)
+        ths = [_th.Thread(target=_imp, args=(a, "A")), _th.Thread(target=_imp, args=(b, "B"))]
+        [t_.start() for t_ in ths]
+        [t_.join(300) for t_ in ths]
+        check("assets: two agents importing the same uncached asset at the same time both get it (one download, no clash)",
+              all(both.get(ag, {}).get("ok") and abs(max(both[ag]["result"]["size_m"]) - 0.8) < 0.01 for ag in ("A", "B")),
+              {ag: (r_.get("error") or r_.get("result")) for ag, r_ in both.items()})
+        res(ex(W1, b, "B", "[bpy.data.objects.remove(o) for o in list(coll.objects) if o.get('asset_id') == 'painted_wooden_chair_02']; result = 1"), "B cleanup")
+        res(ex(W1, a, "A", "[bpy.data.objects.remove(o) for o in list(coll.objects) if o.get('asset_id') == 'painted_wooden_chair_02']; result = 1"), "A cleanup")
+        where = res(ex(W1, a, "A", "result = (sorted(o.name for o in coll.objects if o.get('asset_source') == 'polyhaven'), "
+                                   "[s.material.name if s.material else None for s in bpy.data.objects['b_owned'].material_slots], "
+                                   "(bpy.context.view_layer.objects.active.name, sorted(o.name for o in bpy.context.view_layer.objects if o.select_get())))"), "where")
+        check("assets: polyhaven search + preview sheet; texture material on your object; model in Agent_A at target_size with "
+              "its source; type looked up when omitted; apply_to refuses another agent's object (nothing applied) and a mesh shared "
+              "with one; selection and active object are given back",
+              srch and len(srch["results"]) >= 1 and srch.get("sheet") and os.path.exists(srch["sheet"])
+              and "thumb" not in srch["results"][0] and imp and imp.get("applied_to") == ["mover"]
+              and model and abs(max(model["size_m"]) - 1.0) < 0.01 and untyped["ok"] and abs(max(untyped["result"]["size_m"]) - 0.5) < 0.01
+              and not foreign["ok"] and "not in your collection" in foreign["error"]
+              and not shared["ok"] and "shared" in shared["error"] and where
+              and sorted(where["result"][0]) == sorted(model["objects"] + untyped["result"]["objects"])
+              and not any(m and m.startswith("PH_") for m in where["result"][1]) and list(where["result"][2]) == ["mover", ["mover"]],
+              (srch and srch.get("results"), imp, model, untyped.get("error") or untyped.get("result"), foreign.get("error"),
+               shared.get("error"), where and where.get("result")))
+    else:
+        R.setdefault("skipped", []).append("asset libraries (offline)")
+        print("SKIP assets: offline")
     # hub_exec with a saved script + args (edit the file instead of re-sending the code)
     spath = os.path.join(TMP, "build_step.py")
     with open(spath, "w", encoding="utf-8") as f:
@@ -1088,6 +1291,33 @@ bpy.app.timers.register(_edit_like_user, first_interval=8.0)
     txt50 = "".join(cc.get("text", "") for cc in c50)
     check("mcp: repeated unchanged turntable answers 'unchanged' with no image; no lease block while it is healthy",
           not any(cc.get("type") == "image" for cc in c50) and '"unchanged":true' in txt50 and '"lease"' not in txt50, txt50[:200])
+    # viewport capture with another shading for this capture only (restored after), and scene facts as plain text
+    try:
+        mkey = json.loads(e4["result"]["content"][0]["text"]).get("agent_key")
+    except Exception:
+        mkey = None
+    shade_q = "sp = [a for a in bpy.context.screen.areas if a.type == 'VIEW_3D'][0].spaces.active; result = sp.shading.type"
+    v0 = H.call(mw, "exec", token=mt, agent="M", agent_key=mkey, code=shade_q)
+    send({"jsonrpc": "2.0", "id": 60, "method": "tools/call", "params": {"name": "hub_screenshot", "arguments": {
+        "worker": mw, "token": mt, "shading": "wireframe", "size": 512}}})
+    c60 = wait(60)
+    send({"jsonrpc": "2.0", "id": 61, "method": "tools/call", "params": {"name": "hub_scene", "arguments": {
+        "worker": mw, "token": mt, "fields": ["size", "details"]}}})
+    c61 = wait(61)
+    send({"jsonrpc": "2.0", "id": 62, "method": "tools/call", "params": {"name": "hub_assets", "arguments": {
+        "worker": mw, "token": mt, "agent": "M", "agent_key": mkey, "action": "search", "source": "polyhaven",
+        "query": "x", "filters": {"colour": "red"}}}})
+    c62 = wait(62)
+    txt62 = "".join(cc.get("text", "") for cc in (c62 or {}).get("result", {}).get("content", []))
+    check("mcp: hub_assets filters are validated before reaching the worker",
+          (c62 or {}).get("result", {}).get("isError") and "unknown filters" in txt62, txt62[:200])
+    v1 =H.call(mw, "exec", token=mt, agent="M", agent_key=mkey, code=shade_q)
+    img60 = [cc for cc in (c60 or {}).get("result", {}).get("content", []) if cc.get("type") == "image"]
+    txt61 = "".join(cc.get("text", "") for cc in (c61 or {}).get("result", {}).get("content", []))
+    check("mcp: screenshot shading=wireframe returns an image and restores the user's viewport shading; hub_scene is text",
+          len(img60) == 1 and not (c60 or {}).get("result", {}).get("isError") and v0.get("ok") and v1.get("ok")
+          and v0["result"]["result"] == v1["result"]["result"] and "[mesh]" in txt61 and "faces " in txt61,
+          (v0.get("result"), v1.get("result"), txt61[:200]))
     if imgs:
         with open(os.path.join(TMP, "mcp_sheet.png"), "wb") as f:
             f.write(base64.b64decode(imgs[0]["data"]))
@@ -1126,7 +1356,8 @@ bpy.app.timers.register(_edit_like_user, first_interval=8.0)
     R["free_mb_end"] = free_mb()
     R["finished"] = time.strftime("%Y-%m-%d %H:%M:%S")
     n_ok = sum(1 for cc in R["checks"].values() if cc["ok"])
-    R["summary"] = f"{n_ok}/{len(R['checks'])} checks, {len(R['errors'])} errors"
+    R["summary"] = f"{n_ok}/{len(R['checks'])} checks, {len(R['errors'])} errors" + (
+        f", SKIPPED: {', '.join(R['skipped'])}" if R.get("skipped") else "")
     path = os.path.join(OUT, f"suite-{time.strftime('%Y%m%d-%H%M%S')}.json")
     with open(path, "w", encoding="utf-8") as f:
         json.dump(R, f, indent=1, ensure_ascii=False, default=str)
