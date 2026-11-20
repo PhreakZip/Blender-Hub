@@ -58,7 +58,7 @@ Manual entry (any MCP client that uses `mcpServers`):
 {
   "mcpServers": {
     "blender-hub": {
-      "command": "C:\\Path\\To\\python.exe",
+      "command": "C:\\Path\\To\\pythonw.exe",
       "args": ["C:\\Path\\To\\Blender-Hub\\hub.py"],
       "env": {
         "BLENDER_EXE": "C:\\Program Files\\Blender Foundation\\Blender 5.3\\blender.exe",
@@ -68,6 +68,8 @@ Manual entry (any MCP client that uses `mcpServers`):
   }
 }
 ```
+Use **`pythonw.exe`** (next to `python.exe`): it talks MCP over stdio exactly the same, but never opens a console. With `python.exe` some clients (Claude Desktop among them) sometimes show an empty black "python.exe" window for the hub. The installer picks `pythonw.exe` when it exists and answers over stdio (otherwise it registers `python.exe` and warns).
+
 `BLENDER_HUB_GUI_DEFAULT` is optional (`1` = a live window per session, the default; `0` = background, for machines without a desktop/OpenGL).
 
 Uninstall: `powershell -ExecutionPolicy Bypass -File install.ps1 -ClaudeDesktop -Uninstall` (or `-ClaudeCode` / `-Cursor`; add `-Config "<path>"` if several Claude Desktop configs exist). Every config file is backed up before it is written (`<file>.bak-blender-hub-<timestamp>`). Keep the cloned folder where it is: the config points to it.

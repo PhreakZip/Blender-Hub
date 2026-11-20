@@ -1,5 +1,8 @@
 # Changelog
 
+## 0.13.1 — 2026-11-20
+- No more empty "python.exe" console window: the installer registers the hub with `pythonw.exe` (same stdio MCP, no console) after checking that it really answers over stdio (else `python.exe` with a warning). Every console child the hub starts runs with `CREATE_NO_WINDOW`: `taskkill`, and Blender itself in both modes (blender.exe is a console program; the Blender window is unaffected), so a window worker no longer gets an empty console either. Existing installs: change `python.exe` to `pythonw.exe` in the MCP entry, or run the installer again.
+
 ## 0.13.0 — 2026-11-20
 Everything the standard Blender MCP addon offers, except AI generation (out of scope):
 - `hub_turntable`: new `shading` modes `xray`, `wireframe` (wire copies of the evaluated meshes; originals only hidden from the render) and `cycles` (16 samples + denoise, the hub's light rig); `camera="scene"` renders through the scene camera with the render aspect; `timeline` (a count or a list of frames) makes an animation strip from one fixed view framing the whole motion, restoring the current frame, subframe and unkeyed edits of animated properties; it refuses scenes with unbaked simulations unless `force=true`. Workbench sheets get a temporary world when the scene has none (it was blank). The scene camera and timelines never reuse a sheet.

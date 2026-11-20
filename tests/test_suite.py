@@ -14,6 +14,7 @@ import threading
 import subprocess
 import statistics
 import tempfile
+import shutil
 import contextlib
 import base64
 
@@ -1309,6 +1310,25 @@ bpy.app.timers.register(_edit_like_user, first_interval=8.0)
         "query": "x", "filters": {"colour": "red"}}}})
     c62 = wait(62)
     txt62 = "".join(cc.get("text", "") for cc in (c62 or {}).get("result", {}).get("content", []))
+    # the interpreter the installer registers (pythonw.exe: no console window) really serves MCP over stdio;
+    # a pythonw.exe that does not answer falls back to python.exe
+    import install as inst
+    reg = inst.mcp_python()
+    pw = subprocess.Popen([reg, os.path.join(ROOT, "hub.py")], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                          stderr=subprocess.DEVNULL, text=True, encoding="utf-8", creationflags=inst.NO_WINDOW)
+    pw_out, _ = pw.communicate(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+        "protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "suite", "version": "1"}}}) + "\n"
+        + json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}) + "\n", timeout=60)
+    pw_lines = [json.loads(x) for x in pw_out.splitlines() if x.strip()]
+    fake_dir = tempfile.mkdtemp()
+    for fn_ in ("python.exe", "pythonw.exe"):
+        open(os.path.join(fake_dir, fn_), "w").close()
+    fallback = inst.mcp_python(os.path.join(fake_dir, "python.exe"))
+    shutil.rmtree(fake_dir, ignore_errors=True)
+    check("installer registers pythonw.exe, which answers initialize + tools/list over stdio; a broken pythonw falls back to python.exe",
+          reg.lower().endswith("pythonw.exe") and inst.server_entry("C:/b.exe")["command"] == reg
+          and [x.get("id") for x in pw_lines] == [1, 2] and len(pw_lines[1]["result"]["tools"]) == len(hubmod.TOOLS)
+          and fallback == os.path.join(fake_dir, "python.exe"), (reg, [x.get("id") for x in pw_lines], fallback))
     check("mcp: hub_assets filters are validated before reaching the worker",
           (c62 or {}).get("result", {}).get("isError") and "unknown filters" in txt62, txt62[:200])
     v1 =H.call(mw, "exec", token=mt, agent="M", agent_key=mkey, code=shade_q)

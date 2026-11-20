@@ -24,7 +24,9 @@ import subprocess
 import threading
 import contextlib
 
-VERSION = "0.13.0"
+VERSION = "0.13.1"
+# the hub runs without a console (pythonw.exe): console children like taskkill would each flash a window
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 HERE = os.path.dirname(os.path.abspath(__file__))
 WORKER = os.path.join(HERE, "worker.py")
 sys.path.insert(0, HERE)
@@ -432,8 +434,10 @@ class Hub:
                 "--keep", "20" if gui else "5"]
             with open(log_path, "w", encoding="utf-8", errors="replace") as log:
                 # stdin=DEVNULL: Blender must not inherit (and steal) the MCP stdio
+                # NO_WINDOW in both modes: blender.exe is a console program, and with the hub running as
+                # pythonw.exe a window worker would otherwise get its own empty console (the Blender window is unaffected)
                 p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
-                                     creationflags=0 if gui else getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                                     creationflags=NO_WINDOW)
             ident = _proc_identity(p.pid)
             with _locked():
                 reg = _read_reg()
@@ -493,7 +497,7 @@ class Hub:
         while time.time() - t0 < 15 and _is_our_worker(w):
             time.sleep(0.1)
         if _is_our_worker(w):  # accepted the quit but did not exit: identity checked before killing
-            subprocess.run(["taskkill", "/PID", str(w["pid"]), "/F"], capture_output=True)
+            subprocess.run(["taskkill", "/PID", str(w["pid"]), "/F"], capture_output=True, creationflags=NO_WINDOW)
         with _locked():
             reg = _read_reg()
             if reg.get(name, {}).get("pid") == w["pid"]:
@@ -509,7 +513,7 @@ class Hub:
                 if c:
                     c.close()
             if _is_our_worker(w):
-                subprocess.run(["taskkill", "/PID", str(w["pid"]), "/F"], capture_output=True)
+                subprocess.run(["taskkill", "/PID", str(w["pid"]), "/F"], capture_output=True, creationflags=NO_WINDOW)
         with _locked():
             _write_reg({})
 
@@ -560,7 +564,7 @@ class Hub:
                                   f"its deadline by > {grace:.0f}s (overdue {overdue}s)")
         if not _is_our_worker(w):
             raise RuntimeError("the registry PID is not the worker (not killing)")
-        subprocess.run(["taskkill", "/PID", str(w["pid"]), "/F"], capture_output=True)
+        subprocess.run(["taskkill", "/PID", str(w["pid"]), "/F"], capture_output=True, creationflags=NO_WINDOW)
         t0 = time.time()
         while time.time() - t0 < 10 and _is_our_worker(w):
             time.sleep(0.1)

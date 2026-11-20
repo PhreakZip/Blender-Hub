@@ -37,6 +37,43 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 HUB = os.path.join(HERE, "hub.py")
 MIN_BLENDER = (4, 2)
 TESTED_BLENDER = "5.3"
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+_MCP_PYTHON = {}
+
+
+def _speaks_mcp(exe):
+    """Start `exe hub.py` the way an MCP client does (stdio pipes) and check it answers `initialize`."""
+    p = None
+    try:
+        p = subprocess.Popen([exe, HUB], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                             text=True, encoding="utf-8", creationflags=NO_WINDOW)
+        msg = {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+               "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "install", "version": "1"}}}
+        out, _err = p.communicate(json.dumps(msg) + "\n", timeout=30)
+        return any('"serverInfo"' in line for line in out.splitlines())
+    except Exception:
+        return False
+    finally:  # a pythonw that hangs instead of answering must not stay behind
+        if p is not None and p.poll() is None:
+            p.kill()
+            p.wait()
+
+
+def mcp_python(base=None):
+    """The interpreter written into the MCP entry: pythonw.exe when it exists AND really serves the hub over stdio
+    (an MCP client then never shows an empty console window; python.exe is a console program), else python.exe."""
+    exe = os.path.abspath(sys.executable if base is None else base)
+    if exe in _MCP_PYTHON:
+        return _MCP_PYTHON[exe]
+    w = os.path.join(os.path.dirname(exe), "pythonw.exe")
+    pick = exe
+    if os.name == "nt" and os.path.isfile(w):
+        if _speaks_mcp(w):
+            pick = w
+        else:
+            say(f"{w} did not answer over stdio: registering {exe} (the client may show a console window)", "warn")
+    _MCP_PYTHON[exe] = pick
+    return pick
 
 
 def say(msg, kind="info"):
@@ -92,7 +129,7 @@ def server_entry(blender, background=False, modules=None):
         env["BLENDER_HUB_MODULES"] = ";".join(modules)
     if background:
         env["BLENDER_HUB_GUI_DEFAULT"] = "0"
-    return {"command": sys.executable, "args": [HUB], "env": env}
+    return {"command": mcp_python(), "args": [HUB], "env": env}
 
 
 def backup(path):
@@ -198,8 +235,9 @@ def do_claude_code(args, entry):
         return
     cmd[0] = claude
     if not args.uninstall:  # idempotent: drop an old entry with the same name first
-        subprocess.run([claude, "mcp", "remove", "--scope", "user", args.name], capture_output=True, text=True)
-    r = subprocess.run(cmd, capture_output=True, text=True)
+        subprocess.run([claude, "mcp", "remove", "--scope", "user", args.name], capture_output=True, text=True,
+                       creationflags=NO_WINDOW)
+    r = subprocess.run(cmd, capture_output=True, text=True, creationflags=NO_WINDOW)
     if r.returncode != 0:
         fail(f"claude mcp failed: {r.stderr.strip() or r.stdout.strip()}")
     say(f"{'removed' if args.uninstall else 'registered'} '{args.name}' in Claude Code (user scope); "
@@ -274,7 +312,7 @@ def main():
 
     check_platform()
     if args.uninstall:  # removing must work even if Blender is gone
-        entry = {"command": sys.executable, "args": [HUB], "env": {}}
+        entry = {"command": sys.executable, "args": [HUB], "env": {}}  # removal matches by name: no stdio probe
         blender = None
     else:
         blender = check_blender(args.blender)
