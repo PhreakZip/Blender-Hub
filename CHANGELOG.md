@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.12.0 — 2026-11-20
+- `hub_turntable(shading="rendered")`: the same contact sheet rendered with EEVEE (16 samples), so materials, emissive and light can be reviewed before export. Same image size as the Workbench sheet, so the same token cost (~1,100 for 12 views). With isolation (default) it uses the hub's fixed world and key/fill sun lights, so every review is lit the same way.
+- Reuse of an unchanged sheet works in rendered mode too, with a wider fingerprint (render, EEVEE incl. nested structs, view layer, display device, object visibility flags, texture space, pass index, object custom props). Materials that read images or other objects (Texture Coordinate object, non-geometry Attribute nodes) always re-render.
+- Any turntable now neutralises, then restores, what would make the sheet differ from the model: compositor, sequencer, render border, pixel aspect, multiview, Freestyle, motion blur, simplify, background scene, view-layer material override and samples, look, exposure, gamma, curve mapping.
+- Tool definitions +90 tokens (the new `shading` and `isolate` parameters); typical session ~10,970 tokens (+1%).
+
 ## 0.11.0 — 2026-11-20
 - Token savings that keep quality identical:
   - An identical `hub_turntable` of an unchanged **self-contained mesh** answers `unchanged` with no image (~1,090 → ~70 tokens); the fingerprint covers the evaluated mesh, all modifier settings (render-only too), world matrix, mesh and object-linked materials and scene display settings. Curves/text/metaballs, particles, Geometry Nodes, modifiers that point at other objects, TEXTURE color, isolate=false and custom tag/out_dir always render; `force=true` always renders.

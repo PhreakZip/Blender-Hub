@@ -111,6 +111,7 @@ def _run(rpc, call, out):
                                   code="bpy.ops.mesh.primitive_ico_sphere_add(subdivisions=3, location=(3,0,0)); bpy.context.object.name='rock'; result = {'faces': len(bpy.context.object.data.polygons)}"))
     measure("hub_measure", call("hub_measure", worker=w, token=t, a="Cube", b="rock"))
     measure("hub_turntable_12", call("hub_turntable", worker=w, token=t, agent="A", collection="Agent_A", views=12))
+    measure("hub_turntable_rendered_12", call("hub_turntable", worker=w, token=t, agent="A", collection="Agent_A", views=12, shading="rendered"))
     measure("hub_turntable_repeat", call("hub_turntable", worker=w, token=t, agent="A", collection="Agent_A", views=12))
     sp = os.path.join(STATE, "budget_step.py")
     os.makedirs(STATE, exist_ok=True)

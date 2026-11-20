@@ -53,7 +53,7 @@ try:
 except Exception:
     np = None
 
-VERSION = "0.11.0"
+VERSION = "0.12.0"
 LEASE_TTL_DEFAULT = 900.0
 LEASE_TTL_MAX = 3600.0
 NET_CMDS = {"ping", "status", "check_token"}   # answered outside the queue, without bpy
@@ -313,18 +313,28 @@ def _arr(coll, attr, n, width, dtype="f"):
     return a.tobytes()
 
 
-def _rna_props(struct, depth=0):
-    """Editable props (not read-only ones, which change on evaluation and would raise false alarms)."""
+def _rna_props(struct, depth=0, deep=False):
+    """Editable props (not read-only ones, which change on evaluation and would raise false alarms).
+    deep=True also follows non-ID pointer structs (e.g. eevee.ray_tracing_options), two levels down."""
     out = []
     for p in struct.bl_rna.properties:
-        if p.identifier in {"rna_type", "name"} or p.is_readonly or p.type == "COLLECTION":
+        if p.identifier in {"rna_type", "name", "interop_id"} or p.type == "COLLECTION":  # interop_id: filled lazily on first render
+            continue
+        # read-only props change on evaluation (skip them), except nested setting structs in deep mode
+        # (eevee.ray_tracing_options is a read-only pointer to an editable struct)
+        if p.is_readonly and not (deep and depth < 2 and p.type == "POINTER"):
             continue
         try:
             v = getattr(struct, p.identifier)
         except Exception:
             continue
         if p.type == "POINTER":
-            v = getattr(v, "name", None) if v is not None else None
+            if deep and depth < 2 and v is not None and not isinstance(v, bpy.types.ID):
+                v = _rna_props(v, depth + 1, True)
+            elif p.is_readonly:
+                continue
+            else:
+                v = getattr(v, "name", None) if v is not None else None
         elif hasattr(v, "__len__") and not isinstance(v, str):
             v = tuple(v)
         out.append((p.identifier, v))
@@ -613,6 +623,24 @@ def _set_workbench(render):
                 render.engine = ident
                 return ident
         raise RuntimeError(f"no Workbench engine in this Blender: {e}")
+
+
+def _set_eevee(render):
+    """EEVEE is 'BLENDER_EEVEE' in 5.x and 'BLENDER_EEVEE_NEXT' in 4.2-4.x."""
+    for ident in ("BLENDER_EEVEE", "BLENDER_EEVEE_NEXT"):
+        try:
+            render.engine = ident
+            return ident
+        except TypeError:
+            continue
+    raise RuntimeError("no EEVEE engine in this Blender")
+
+
+def _shading_arg(req):
+    sh = str(req.get("shading") or "solid").lower()
+    if sh not in ("solid", "rendered"):
+        raise ValueError("shading must be 'solid' (Workbench) or 'rendered' (EEVEE)")
+    return sh
 
 
 # ---------------------------------------------------------------- watchdog timeout
@@ -1117,13 +1145,15 @@ TT_CACHE = {}  # (agent, target, params) -> (fingerprint, result): a repeated tu
 TT_CACHE_MAX = 50
 
 
-def _tt_fingerprint(obs, color):
+def _tt_fingerprint(obs, color, shading="solid"):
     """Fingerprint of WHAT WORKBENCH DRAWS for self-contained meshes: the evaluated mesh of every target, all its
     modifier settings (render-only too), world matrix, mesh and object-linked materials, plus the scene display
     settings. Returns None (= always render) unless every target is a MESH with no particles, no Geometry Nodes
     and no modifier pointing at another object/collection (curves, text, metaballs, booleans with outside cutters
-    always render), and also for TEXTURE color or when a target is instanced."""
-    if str(color).upper() == "TEXTURE":
+    always render), and also for TEXTURE color or when a target is instanced.
+    shading='rendered' (EEVEE, isolated, with the hub's own fixed light rig and world) also hashes the EEVEE
+    settings, and never reuses when a target material uses an image (its pixels are not hashed)."""
+    if shading == "solid" and str(color).upper() == "TEXTURE":
         return None
     # Reuse only for SELF-CONTAINED meshes: anything whose render can depend on data outside the target's own
     # mesh/modifiers (curves/text/metaballs with render resolutions, particle hair, Geometry Nodes, modifiers
@@ -1146,7 +1176,17 @@ def _tt_fingerprint(obs, color):
         if inst.is_instance and inst.parent is not None and inst.parent.original.name in names:
             return None
     sc = bpy.context.scene
-    parts = [_rna_props(sc.display.shading), _rna_props(sc.display), _rna_props(sc.view_settings)]
+    vl = bpy.context.view_layer
+    # scene-level settings that change the pixels (whatever the turntable does not force to a fixed value)
+    parts = [shading, _rna_props(sc.display.shading), _rna_props(sc.display), _rna_props(sc.view_settings, deep=True),
+             _rna_props(sc.display_settings), _rna_props(sc.render, deep=True), _rna_props(vl)]
+    if shading == "rendered":
+        parts.append(_rna_props(sc.eevee, deep=True))
+        for ob in obs:
+            for s in ob.material_slots:
+                mt = s.material
+                if mt and mt.node_tree and any(_node_reads_outside(nd) for nd in _all_nodes(mt.node_tree, set())):
+                    return None  # image pixels, other objects, object/scene/view-layer attributes: not hashed
     for ob in sorted(obs, key=lambda o: o.name):
         ev = ob.evaluated_get(dg)
         me = ev.to_mesh()
@@ -1175,12 +1215,43 @@ def _tt_fingerprint(obs, color):
                     mods.append(_gn_inputs(m))
                     if m.node_group:
                         mods.append(_tree_hash(m.node_group, set()))
+            vis = tuple(getattr(src, k, None) for k in _VIS_FLAGS)
+            md = src.data
+            texspace = (getattr(md, "use_auto_texspace", None), tuple(getattr(md, "texspace_location", ()) or ()),
+                        tuple(getattr(md, "texspace_size", ()) or ()))
             parts.append((ob.name, _h(*mesh_parts), tuple(round(v, 5) for row in ev.matrix_world for v in row), mats,
-                          ev.hide_render, tuple(ev.color), _h(*mods)))
+                          ev.hide_render, tuple(ev.color), _h(*mods), vis, texspace, src.pass_index, _idprops(src)))
         finally:
             with contextlib.suppress(Exception):
                 ev.to_mesh_clear()
     return _h(*parts)
+
+
+_VIS_FLAGS = ("visible_camera", "visible_shadow", "visible_diffuse", "visible_glossy", "visible_transmission",
+              "visible_volume_scatter", "hide_probe_volume", "hide_probe_sphere", "hide_probe_plane", "is_holdout",
+              "is_shadow_catcher")
+
+
+def _node_reads_outside(nd):
+    """A shader node whose output depends on data the fingerprint does not hash."""
+    if nd.bl_idname == "ShaderNodeAttribute" and getattr(nd, "attribute_type", "GEOMETRY") != "GEOMETRY":
+        return True
+    for p in nd.bl_rna.properties:
+        if p.type == "POINTER" and p.identifier != "rna_type":
+            v = getattr(nd, p.identifier, None)
+            if isinstance(v, bpy.types.ID) and not isinstance(v, bpy.types.NodeTree):
+                return True  # image, object (Texture Coordinate), text, ...
+    return False
+
+
+def _all_nodes(tree, seen):
+    if tree is None or tree.name in seen:
+        return
+    seen.add(tree.name)
+    for nd in tree.nodes:
+        yield nd
+        if getattr(nd, "node_tree", None):
+            yield from _all_nodes(nd.node_tree, seen)
 
 
 def cmd_turntable(req):
@@ -1193,22 +1264,23 @@ def cmd_turntable(req):
     if n < 1 or n > 48:
         raise ValueError("views must be between 1 and 48")
     size = min(max(int(req.get("size", 256)), 64), 1024)
+    shading = _shading_arg(req)
     isolate_req = req.get("isolate", True)
-    key = (req["_agent"], tuple(sorted(o.name for o in obs)), n, size, str(req.get("color", "MATERIAL")),
+    key = (req["_agent"], tuple(sorted(o.name for o in obs)), n, size, shading, str(req.get("color", "MATERIAL")),
            str(req.get("elev")), bpy.context.scene.frame_current)
     # no reuse without isolation (other objects show) or with a caller-chosen tag/out_dir (the file may be overwritten)
     reusable = isolate_req and not req.get("tag") and not req.get("out_dir")
     fp = None
     if reusable:
         try:
-            fp = _tt_fingerprint(obs, req.get("color", "MATERIAL"))
+            fp = _tt_fingerprint(obs, req.get("color", "MATERIAL"), shading)
         except Exception:
             fp = None  # cannot prove it unchanged: render
     cached = TT_CACHE.get(key)
     if (fp and not req.get("force") and cached and cached[0] == fp and cached[1].get("sheet")
             and os.path.exists(cached[1]["sheet"]) and os.path.getmtime(cached[1]["sheet"]) == cached[2]):
         return dict(cached[1], unchanged=True)
-    result = _turntable_render(req, obs, n, size)
+    result = _turntable_render(req, obs, n, size, shading)
     if fp and result.get("sheet") and os.path.exists(result["sheet"]):
         TT_CACHE[key] = (fp, result, os.path.getmtime(result["sheet"]))
         while len(TT_CACHE) > TT_CACHE_MAX:
@@ -1216,7 +1288,7 @@ def cmd_turntable(req):
     return result
 
 
-def _turntable_render(req, obs, n, size):
+def _turntable_render(req, obs, n, size, shading="solid"):
     out_dir = req.get("out_dir") or os.path.join(ARGS["state"], "renders", ARGS["name"])
     os.makedirs(out_dir, exist_ok=True)
     tag = f"{req['_agent']}_{re.sub(r'[^A-Za-z0-9_-]', '', str(req.get('tag') or int(time.time() * 1000)))}"
@@ -1228,13 +1300,36 @@ def _turntable_render(req, obs, n, size):
     world = sc.world
     saved = [(r, k, getattr(r, k)) for k in ("engine", "resolution_x", "resolution_y", "resolution_percentage",
                                              "filepath", "film_transparent")]
+    # look first: restored in reverse order, so the look is set back AFTER its view transform
     saved += [(r.image_settings, "file_format", r.image_settings.file_format), (sc, "camera", sc.camera),
-              (vs, "view_transform", vs.view_transform)]
+              (vs, "look", vs.look), (vs, "view_transform", vs.view_transform)]
+    # anything that would make the review differ from the model itself: forced off for the turntable, restored after
+    neutral = [(r, "use_compositing", False), (r, "use_sequencer", False), (r, "use_border", False),
+               (r, "pixel_aspect_x", 1.0), (r, "pixel_aspect_y", 1.0), (r, "use_multiview", False),
+               (r, "use_freestyle", False), (r, "use_motion_blur", False), (r, "use_simplify", False),
+               (vs, "exposure", 0.0), (vs, "gamma", 1.0), (vs, "use_curve_mapping", False),
+               (sc, "background_set", None)]
+    vl = bpy.context.view_layer
+    if hasattr(vl, "material_override"):
+        neutral.append((vl, "material_override", None))
+    if hasattr(vl, "samples"):
+        neutral.append((vl, "samples", 0))
+    for obj, attr, _v in neutral:
+        if hasattr(obj, attr):
+            saved.append((obj, attr, getattr(obj, attr)))
     saved += [(shd, k, getattr(shd, k)) for k in ("light", "color_type", "show_cavity")]
     if world:
         saved.append((world, "color", tuple(world.color)))
+    saved.append((sc, "world", world))
+    ee = getattr(sc, "eevee", None)
+    if ee is not None and hasattr(ee, "taa_render_samples"):
+        saved.append((ee, "taa_render_samples", ee.taa_render_samples))
     frames, sheet, cam, cam_data = [], None, None, None
+    rig = []  # temporary lights/world of the rendered mode, removed in finally
     try:
+        for obj, attr, v in neutral:
+            with contextlib.suppress(Exception):
+                setattr(obj, attr, v)
         if isolate:
             keep = {o.name for o in obs}
             for o in sc.objects:
@@ -1262,22 +1357,53 @@ def _turntable_render(req, obs, n, size):
         cam_data = bpy.data.cameras.new(f"hub_cam_{tag}")
         cam = bpy.data.objects.new(f"hub_cam_{tag}", cam_data)
         sc.collection.objects.link(cam)
-        _set_workbench(r)
-        shd.light = "STUDIO"
-        want = req.get("color", "MATERIAL")
-        try:
-            shd.color_type = want
-        except TypeError:  # 5.3: VERTEX; 4.x: ATTRIBUTE
-            alt = {"ATTRIBUTE": "VERTEX", "VERTEX": "ATTRIBUTE"}.get(want)
-            shd.color_type = alt if alt else "MATERIAL"
-        shd.show_cavity = True
+        if shading == "rendered":
+            _set_eevee(r)
+            if ee is not None and hasattr(ee, "taa_render_samples"):
+                ee.taa_render_samples = 16  # at <= 1024 px per view more samples change nothing visible
+            no_light = sc.world is None and not any(
+                o.type == "LIGHT" and not o.hide_render and not any(c.hide_render for c in o.users_collection)
+                for o in bpy.context.view_layer.objects)  # lights the render can actually see
+            if isolate or no_light:  # same light for every review: the hub's rig, not whatever the scene has
+                tw = bpy.data.worlds.new(f"hub_world_{tag}")
+                rig.append(("world", tw))
+                tw.color = (0.25, 0.26, 0.28)
+                if tw.node_tree is None and hasattr(tw, "use_nodes"):
+                    with contextlib.suppress(Exception):
+                        tw.use_nodes = True
+                bg = tw.node_tree.nodes.get("Background") if tw.node_tree else None
+                if bg is not None:
+                    bg.inputs[0].default_value = (0.25, 0.26, 0.28, 1.0)
+                    bg.inputs[1].default_value = 1.0
+                sc.world = tw
+                for nm, energy, rot in (("key", 4.0, (math.radians(50), 0, math.radians(35))),
+                                        ("fill", 1.0, (math.radians(65), 0, math.radians(215)))):
+                    ld = bpy.data.lights.new(f"hub_{nm}_{tag}", "SUN")
+                    rig.append(("light", ld))
+                    ld.energy = energy
+                    lo_ = bpy.data.objects.new(f"hub_{nm}_{tag}", ld)
+                    rig.append(("object", lo_))
+                    lo_.rotation_euler = rot
+                    sc.collection.objects.link(lo_)
+        else:
+            _set_workbench(r)
+            shd.light = "STUDIO"
+            want = req.get("color", "MATERIAL")
+            try:
+                shd.color_type = want
+            except TypeError:  # 5.3: VERTEX; 4.x: ATTRIBUTE
+                alt = {"ATTRIBUTE": "VERTEX", "VERTEX": "ATTRIBUTE"}.get(want)
+                shd.color_type = alt if alt else "MATERIAL"
+            shd.show_cavity = True
         r.resolution_x = r.resolution_y = size
         r.resolution_percentage = 100
         r.image_settings.file_format = "PNG"
         r.film_transparent = False
         with contextlib.suppress(TypeError):
             vs.view_transform = "Standard"
-        if world:
+        with contextlib.suppress(TypeError):
+            vs.look = "None"
+        if world and shading == "solid":
             world.color = (0.55, 0.57, 0.6)
         sc.camera = cam
         lo, hi = _bbox(obs)
@@ -1296,7 +1422,13 @@ def _turntable_render(req, obs, n, size):
             cam.rotation_euler = (center - pos).to_track_quat("-Z", "Y").to_euler()
             path = os.path.join(out_dir, f"{tag}_{i:02d}.png")
             r.filepath = path
-            bpy.ops.render.render(write_still=True)
+            try:
+                bpy.ops.render.render(write_still=True)
+            except Exception as e:
+                if shading == "rendered":
+                    raise RuntimeError(f"shading='rendered' (EEVEE) failed: {e}. It needs a Blender that can use the "
+                                       "GPU (a window, or -b with a GPU); use shading='solid' here") from e
+                raise
             frames.append(path)
         if np is not None and req.get("sheet", True):
             cols = min(int(req.get("cols", 4)), n)
@@ -1330,7 +1462,12 @@ def _turntable_render(req, obs, n, size):
         for obj, attr, val in reversed(saved):  # field by field, in reverse order
             with contextlib.suppress(Exception):
                 setattr(obj, attr, val)
-    return {"frames": frames, "sheet": sheet, "views": n, "size": size}
+        for want in ("object", "light", "world"):  # objects before the light data they use
+            for kind, idb in rig:
+                if kind == want:
+                    with contextlib.suppress(Exception):
+                        {"object": bpy.data.objects, "light": bpy.data.lights, "world": bpy.data.worlds}[kind].remove(idb)
+    return {"frames": frames, "sheet": sheet, "views": n, "size": size, "shading": shading}
 
 
 def _require_owner_coll(req, name):

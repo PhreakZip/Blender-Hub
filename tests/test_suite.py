@@ -601,6 +601,76 @@ bpy.context.object.data.bevel_depth = 0.05
     check("turntable reuse sees what is DRAWN: moved boolean cutter outside the list, curve bevel -> new render; TEXTURE never reuses",
           wall2 and not wall2.get("unchanged") and pipe2 and not pipe2.get("unchanged") and tex2 and not tex2.get("unchanged"),
           [bool(x and x.get("unchanged")) for x in (wall2, pipe2, tex1, tex2)])
+    # shading="rendered": EEVEE sheet with the hub's own light rig (emissive visible), same reuse rules, scene restored
+    before = res(ex(W1, a, "A", """
+w0 = bpy.context.scene.world
+bpy.ops.mesh.primitive_cube_add(location=(0, -80, 0)); o = bpy.context.object; o.name = 'glow'
+m = bpy.data.materials.new('glow_mat'); o.data.materials.append(m)
+if m.node_tree is None: m.use_nodes = True
+p = m.node_tree.nodes.get('Principled BSDF')
+p.inputs['Base Color'].default_value = (0.05, 0.05, 0.05, 1)
+p.inputs['Emission Color'].default_value = (1, 0.1, 0.05, 1); p.inputs['Emission Strength'].default_value = 4.0
+bpy.ops.mesh.primitive_cube_add(location=(0, -90, 0)); t = bpy.context.object; t.name = 'texd'
+mt = bpy.data.materials.new('tex_mat'); t.data.materials.append(mt)
+if mt.node_tree is None: mt.use_nodes = True
+im = bpy.data.images.new('tex_img', 8, 8); n = mt.node_tree.nodes.new('ShaderNodeTexImage'); n.image = im
+mt.node_tree.links.new(n.outputs[0], mt.node_tree.nodes['Principled BSDF'].inputs['Base Color'])
+sc = bpy.context.scene
+result = (sc.render.engine, w0.name if w0 else None, sc.eevee.taa_render_samples, sc.view_settings.look,
+          sc.render.use_compositing)
+"""), "emissive + textured cubes")
+    rd_args = dict(token=a, agent="A", views=4, size=128, shading="rendered")
+    rd1 = res(H.call(W1, "turntable", objects=["glow"], **rd_args), "rendered 1")
+    rd2 = res(H.call(W1, "turntable", objects=["glow"], **rd_args), "rendered 2")
+    sol = res(H.call(W1, "turntable", objects=["glow"], token=a, agent="A", views=4, size=128), "solid after rendered")
+    rd2b = res(H.call(W1, "turntable", objects=["glow"], **rd_args), "rendered again after solid")
+    # every setting EEVEE draws with must invalidate the reused sheet
+    flips = {"eevee ray tracing (nested struct)": "sc.eevee.ray_tracing_options.resolution_scale = '4' if sc.eevee.ray_tracing_options.resolution_scale != '4' else '2'",
+             "view layer material override": "vl.material_override = bpy.data.materials['tex_mat']",
+             "object visible_shadow": "bpy.data.objects['glow'].visible_shadow = False",
+             "render use_compositing": "sc.render.use_compositing = not sc.render.use_compositing"}
+    flip_res = {}
+    for label, code in flips.items():
+        res(H.call(W1, "turntable", objects=["glow"], **rd_args), "prime " + label)
+        ctl = res(H.call(W1, "turntable", objects=["glow"], **rd_args), "control " + label)  # stable before the change
+        res(ex(W1, a, "A", "sc = bpy.context.scene; vl = bpy.context.view_layer; " + code), label)
+        x = res(H.call(W1, "turntable", objects=["glow"], **rd_args), "after " + label)
+        x2 = res(H.call(W1, "turntable", objects=["glow"], **rd_args), "after again " + label)  # stable after it
+        flip_res[label] = (bool(ctl and ctl.get("unchanged")), bool(x and not x.get("unchanged")),
+                           bool(x2 and x2.get("unchanged")))
+    res(ex(W1, a, "A", "bpy.context.view_layer.material_override = None; bpy.data.objects['glow'].visible_shadow = True"), "undo flips")
+    check("rendered reuse: a changed nested EEVEE setting, material override, visibility flag or compositing renders again",
+          all(all(v) for v in flip_res.values()), flip_res)
+    res(ex(W1, a, "A", "bpy.data.materials['glow_mat'].node_tree.nodes['Principled BSDF'].inputs['Emission Strength'].default_value = 0.0"), "emission off")
+    rd3 = res(H.call(W1, "turntable", objects=["glow"], **rd_args), "rendered 3")
+    tx1 = res(H.call(W1, "turntable", objects=["texd"], **rd_args), "rendered tex 1")
+    tx2 = res(H.call(W1, "turntable", objects=["texd"], **rd_args), "rendered tex 2")
+    bad = H.call(W1, "turntable", objects=["glow"], token=a, agent="A", agent_key=KEYS.get("A"), views=4, shading="cycles")
+    check("turntable shading=rendered: EEVEE sheet; repeat reuses; solid is a separate review; emission change renders; image textures never reuse; bad shading refused",
+          rd1 and rd1.get("shading") == "rendered" and rd1.get("sheet") and os.path.exists(rd1["sheet"])
+          and rd2 and rd2.get("unchanged") and sol and not sol.get("unchanged") and rd2b and rd2b.get("unchanged")
+          and rd3 and not rd3.get("unchanged") and tx1 and tx1.get("sheet") and tx2 and not tx2.get("unchanged") and not bad["ok"] and "shading" in (bad.get("error") or ""),
+          [bool(x and x.get("unchanged")) for x in (rd1, rd2, sol, rd2b, rd3, tx1, tx2)] + [bad.get("error")])
+    r = ex(W1, a, "A", f"""
+def stats(path):
+    img = bpy.data.images.load(path, check_existing=False)
+    px = np.empty(len(img.pixels), dtype=np.float32); img.pixels.foreach_get(px); px = px.reshape(-1, 4)
+    bpy.data.images.remove(img)
+    return float((px[:, 0] - px[:, 1]).max())
+sc = bpy.context.scene
+left = [o.name for o in bpy.data.objects if o.name.startswith(('hub_key_', 'hub_fill_', 'hub_cam_'))]
+left += [w.name for w in bpy.data.worlds if w.name.startswith('hub_world_')]
+left += [l.name for l in bpy.data.lights if l.name.startswith(('hub_key_', 'hub_fill_'))]
+result = (stats(r'{rd1['sheet'] if rd1 else ''}'), stats(r'{rd3['sheet'] if rd3 else ''}'),
+          [sc.render.engine, sc.world.name if sc.world else None, sc.eevee.taa_render_samples, sc.view_settings.look,
+           sc.render.use_compositing], left)
+""")
+    rr = r["result"]["result"] if r["ok"] and r["result"].get("result") else None
+    exp = list(before["result"]) if before and before.get("result") else None
+    if exp:
+        exp[4] = not exp[4]  # the compositing flip above was left flipped on purpose
+    check("rendered sheet shows the emissive glow (red >> green) and not after emission is off; engine/world/samples/look restored, no rig left",
+          rr and rr[0] > 0.2 and rr[1] < 0.05 and rr[2] == exp and rr[3] == [], (rr, exp))
     # hub_exec with a saved script + args (edit the file instead of re-sending the code)
     spath = os.path.join(TMP, "build_step.py")
     with open(spath, "w", encoding="utf-8") as f:

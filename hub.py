@@ -24,7 +24,7 @@ import subprocess
 import threading
 import contextlib
 
-VERSION = "0.11.0"
+VERSION = "0.12.0"
 HERE = os.path.dirname(os.path.abspath(__file__))
 WORKER = os.path.join(HERE, "worker.py")
 sys.path.insert(0, HERE)
@@ -842,9 +842,9 @@ TOOLS = [
      {"worker": S, "token": TOKEN, "agent": S, "agent_key": KEY, "task": S}, ["worker", "token", "agent", "task"]),
     ("hub_measure", "Distance, intersection and penetration between objects a and b (world space). Move b by -delta_a_to_b to make it touch a (null if they penetrate).",
      {"worker": S, "token": TOKEN, "a": S, "b": S, "tol": {"type": "number"}}, ["worker", "token", "a", "b"]),
-    ("hub_turntable", "Review sheet: N renders around a collection/objects (low to high), returned as one image. views default 12, size default 256 px per view; frames=true also lists the frame files. If what is drawn did not change since your last identical turntable it answers unchanged (no image; that sheet is still valid); force=true renders anyway — use it if the earlier image is no longer in your context.",
+    ("hub_turntable", "Review sheet: N renders around a collection/objects (low to high), returned as one image. views default 12, size default 256 px per view; shading=rendered: EEVEE (materials, emissive, light; hub lights when isolate=true, the default (false shows other objects, never reuses); color ignored; image/object-reading materials always re-render), default solid (Workbench); frames=true also lists the frame files. If what is drawn did not change since your last identical turntable it answers unchanged (no image; that sheet is still valid); force=true renders anyway — use it if the earlier image is no longer in your context.",
      {"worker": S, "token": TOKEN, "agent": S, "agent_key": KEY, "collection": S, "objects": {"type": "array", "items": S},
-      "views": {"type": "integer"}, "size": {"type": "integer"}, "color": S, "note": NOTE, "frames": {"type": "boolean"}, "force": {"type": "boolean"}},
+      "views": {"type": "integer"}, "size": {"type": "integer"}, "color": S, "shading": {"type": "string", "enum": ["solid", "rendered"]}, "isolate": {"type": "boolean"}, "note": NOTE, "frames": {"type": "boolean"}, "force": {"type": "boolean"}},
      ["worker", "token", "agent"]),
     ("hub_export_collection", "Save your collection to a .blend.",
      {"worker": S, "token": TOKEN, "agent": S, "agent_key": KEY, "collection": S, "path": S, "note": NOTE},

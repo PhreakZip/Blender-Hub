@@ -9,7 +9,7 @@ Built for Claude (Desktop / Code) and any MCP client. Windows only. No dependenc
 | Agents in parallel | 1 Blender, one command at a time | Pool of up to 10 Blenders (configurable), one per agent |
 | Two agents, one scene | They can overwrite each other silently | Each agent owns a collection; touching someone else's work is reported to both |
 | Identity | None | Lease token per session + `agent_key` per agent |
-| Review renders | One viewport capture per call | `hub_turntable`: 12 views + one contact sheet in ~1 s |
+| Review renders | One viewport capture per call | `hub_turntable`: 12 views + one contact sheet in ~1 s; `shading="rendered"` for an EEVEE sheet (materials, emissive, light) at the same token cost |
 | Fitting parts together | Guess coordinates | `hub_measure`: distance, intersection, penetration and the exact move to make them touch |
 | Crash / forgotten agent | Work lost | Rotating autosaves, archives, `hub_restart_worker`, `hub_restore_archive` |
 | Watch live | Yes (one window) | Yes, by default: one window per session, with `hub_view` / `hub_screenshot` and a live panel of who is working |
@@ -145,7 +145,7 @@ hub_release(worker, token)   # when you are done
 - **Shared scene etiquette:** read anything, change only your own collection. To fit your part against another agent's part, call `hub_measure(a=<their object>, b=<yours>)` and move **your** object by `-delta_a_to_b`. Do not move theirs. `delta_a_to_b` is `null` when the objects already penetrate (`penetrating: true`): move yours apart first.
 - **Exclusive** = you alone (the `"base"` objects from an opened `.blend` are yours too). **Shared** = several leases; nobody can upgrade to exclusive while others are inside.
 - **Timeouts:** `hub_exec` has `timeout` (default 120 s, max 1800). Long C-level calls cannot be interrupted; if a worker is stuck, use `hub_kill_worker` (allowed only for the sole lease holder or after the job's own deadline + 60 s).
-- **Reviewing your work:** `hub_turntable(worker, token, agent="<you>", collection="Agent_<you>", views=12)` returns one contact-sheet image with 12 angles (low to high). Use it instead of many single captures.
+- **Reviewing your work:** `hub_turntable(worker, token, agent="<you>", collection="Agent_<you>", views=12)` returns one contact-sheet image with 12 angles (low to high). Use it instead of many single captures. Add `shading="rendered"` when materials, emissive or lighting matter (EEVEE, the hub's fixed lights): same image size, so same tokens, just slower to render.
 - **Live by default:** `hub_acquire` / `hub_start_worker` open a Blender **window** unless you pass `gui=false` (server default `BLENDER_HUB_GUI_DEFAULT=1`). One window per session: call `hub_view(collection=...)` after a meaningful step so the user's viewport frames your work, and `hub_screenshot` to see exactly what they see. Use `gui=false` for background or many-parallel batch work.
 - **When you finish:** `hub_release`, then ask the user whether to close the window (`hub_stop_worker`). Windows never close on their own, are never recycled, and count against both the pool limit (10) and the window cap (4); when a limit is hit, the error lists the open windows to close.
 - **Errors are actionable**: `your lease expired` → `hub_lease(worker, mode=<your original mode>, label=...)` for a new token, then pass `agent_key` in your next `hub_exec` / `hub_turntable` / `hub_export_collection`; `requires a valid lease token ... was RECYCLED ...` → `hub_restore_archive(archive)`; `already exists: resuming it requires its agent_key` → use your key, or `hub_agent_key` with a token that still uses the agent.
@@ -168,7 +168,7 @@ For fully independent tasks (10 different assets), give each agent its own **exc
 | `hub_exec` | Run Python in Blender as `agent` (required): `code`, or `script` (absolute path to a saved `.py`, BOM ok, `__file__` set; not both) with `args` (a dict, available as `args`). Also `timeout`, `agent_key`, `note` (what this step does, shown live). |
 | `hub_note` | Declare the task you are working on (`task`); shown live in the window's panel and in `hub_list_workers`. |
 | `hub_measure` | Min distance, intersecting faces, penetration (ray-parity), manifold flags and `delta_a_to_b` between two objects. `tol` = edge sample spacing. |
-| `hub_turntable` | N renders around the target (Workbench) + a contact sheet returned as an image. `agent` required; `views` 1–48 (default 12), `size` 64–1024 (default 256). An identical turntable of an unchanged model answers `unchanged` without an image; `force=true` renders anyway. |
+| `hub_turntable` | N renders around the target + a contact sheet returned as an image. `agent` required; `views` 1–48 (default 12), `size` 64–1024 (default 256); `shading` `solid` (Workbench, default: form and color) or `rendered` (EEVEE, 16 samples: materials, emissive, light; `color` is ignored; with `isolate` (default) the hub uses its own fixed world and two sun lights, otherwise the scene's, or the hub's if the scene has none). Needs a Blender that can use the GPU; if EEVEE fails, the error says to use `solid`. During any turntable the compositor, sequencer, render border, Freestyle, motion blur, simplify, background scene, view-layer material override, look, exposure and gamma are neutralised and then restored, so the sheet shows the model itself. An identical turntable of an unchanged model answers `unchanged` without an image; in rendered mode, materials that read images or other objects always re-render; `force=true` renders anyway. |
 | `hub_view` | Window mode: frame the viewport on a collection/objects (keeps the user's selection). |
 | `hub_screenshot` | Window mode: what the user sees — by default only the 3D viewport, longest side `size` px (1024); `full=true` for the whole window. Returned as an image. |
 | `hub_export_collection` | Save your collection to a `.blend`. `agent` required. |
@@ -244,7 +244,7 @@ Environment variables (set them in the MCP entry's `env`):
 ```powershell
 python tests\test_suite.py --max-workers 10 --jobs 20
 ```
-Uses its own state folder and ports **9981+**, so it never touches real workers or your Blender. It starts up to 10 Blenders (needs ~3 GB free RAM), briefly opens a few visible Blender windows (window-mode and MCP-default checks), and takes about 4 minutes. 144 checks: pool, identity, leases, 18 kinds of cross-agent changes, false-alarm cases, watchdog, kill, autosave/restore, measure accuracy, turntable, window mode, MCP stdio protocol. Results go to `tests/results/`.
+Uses its own state folder and ports **9981+**, so it never touches real workers or your Blender. It starts up to 10 Blenders (needs ~3 GB free RAM), briefly opens a few visible Blender windows (window-mode and MCP-default checks), and takes about 4 minutes. 147 checks: pool, identity, leases, 18 kinds of cross-agent changes, false-alarm cases, watchdog, kill, autosave/restore, measure accuracy, turntable (solid and rendered), window mode, MCP stdio protocol. Results go to `tests/results/`.
 
 ## Token budget
 Images cost tokens by pixel count and stay in the conversation, so the hub keeps them small; text replies are compact JSON. Measured with `python tests/token_budget.py` (a typical modeling session: 1 acquire, 1 note, 25 exec, 4 turntables, 4 screenshots, 2 status calls; each reply counted once — images stay in the conversation, so their real cumulative cost is higher, which makes the image savings matter more):
@@ -252,7 +252,7 @@ Images cost tokens by pixel count and stay in the conversation, so the hub keeps
 | | 0.9.0 | 0.10.0 | 0.11.0 |
 |---|---|---|---|
 | `hub_screenshot` (viewport only, ≤ 1024 px instead of the 1920×1009 window) | ~2,650 | ~850 | ~830 |
-| `hub_turntable` (no list of frame paths in the reply) | ~1,480 | ~1,100 | ~1,090 (repeat of an unchanged model: ~70) |
+| `hub_turntable` (no list of frame paths in the reply) | ~1,480 | ~1,100 | ~1,090 (repeat of an unchanged model: ~70; 0.12.0 `rendered`: ~1,100, same as solid) |
 | `hub_list_workers` (short by default) | ~300 per worker | ~50 per worker | ~50 per worker |
 | `hub_exec` reply | ~40 | ~22 | ~10 |
 | tool definitions + instructions | ~3,100 | ~2,560 | ~2,750 |
