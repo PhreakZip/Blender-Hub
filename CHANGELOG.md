@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.11.0 — 2026-11-20
+- Token savings that keep quality identical:
+  - An identical `hub_turntable` of an unchanged **self-contained mesh** answers `unchanged` with no image (~1,090 → ~70 tokens); the fingerprint covers the evaluated mesh, all modifier settings (render-only too), world matrix, mesh and object-linked materials and scene display settings. Curves/text/metaballs, particles, Geometry Nodes, modifiers that point at other objects, TEXTURE color, isolate=false and custom tag/out_dir always render; `force=true` always renders.
+  - `hub_exec(script=<.py>, args={...})` runs a saved file: edit it between attempts instead of re-sending the code (`args` is now a reserved module name).
+  - Replies carry the lease block only when it needs attention (expiring in < 5 min, or lost).
+
 ## 0.10.0 — 2026-11-20
 - Token diet (typical session ~21.3k → ~11.1k tokens, measured by the new `tests/token_budget.py`):
   - `hub_screenshot` captures only the 3D viewport and scales it to `size` px (default 1024); `full=true` for the whole window.

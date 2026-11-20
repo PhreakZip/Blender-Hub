@@ -24,7 +24,7 @@ import subprocess
 import threading
 import contextlib
 
-VERSION = "0.10.0"
+VERSION = "0.11.0"
 HERE = os.path.dirname(os.path.abspath(__file__))
 WORKER = os.path.join(HERE, "worker.py")
 sys.path.insert(0, HERE)
@@ -834,16 +834,17 @@ TOOLS = [
      {"archive": S, "name": S, "gui": {"type": "boolean"}}, ["archive"]),
     ("hub_kill_worker", "Kill a hung worker and boot it from autosave (only the sole lease holder, or when its job is past its own timeout + grace).",
      {"name": S, "token": TOKEN}, ["name"]),
-    ("hub_exec", "Run bpy Python as `agent`. Objects created go to Agent_<agent> (link(ob) for bpy.data.objects.new); set `result` to return data; modules from BLENDER_HUB_MODULES (e.g. K) are preloaded. timeout s (default 120). The first call that names a new agent returns agent_key: keep it.",
-     {"worker": S, "token": TOKEN, "agent": S, "agent_key": KEY, "code": S, "timeout": {"type": "number"}, "note": NOTE},
-     ["worker", "token", "agent", "code"]),
+    ("hub_exec", "Run bpy Python as `agent`: `code`, or `script` (path to a saved .py; edit the file between runs instead of re-sending code) with optional `args` (dict, available as `args`). Objects created go to Agent_<agent> (link(ob) for bpy.data.objects.new); set `result` to return data; modules from BLENDER_HUB_MODULES (e.g. K) are preloaded. timeout s (default 120). The first call that names a new agent returns agent_key: keep it.",
+     {"worker": S, "token": TOKEN, "agent": S, "agent_key": KEY, "code": S, "script": S, "args": {"type": "object"},
+      "timeout": {"type": "number"}, "note": NOTE},
+     ["worker", "token", "agent"]),
     ("hub_note", "Declare the task you are working on (shown live; call at start and when it changes). Returns agent_key on the first call for a new agent.",
      {"worker": S, "token": TOKEN, "agent": S, "agent_key": KEY, "task": S}, ["worker", "token", "agent", "task"]),
     ("hub_measure", "Distance, intersection and penetration between objects a and b (world space). Move b by -delta_a_to_b to make it touch a (null if they penetrate).",
      {"worker": S, "token": TOKEN, "a": S, "b": S, "tol": {"type": "number"}}, ["worker", "token", "a", "b"]),
-    ("hub_turntable", "Review sheet: N renders around a collection/objects (low to high), returned as one image. views default 12, size default 256 px per view; frames=true also lists the frame files.",
+    ("hub_turntable", "Review sheet: N renders around a collection/objects (low to high), returned as one image. views default 12, size default 256 px per view; frames=true also lists the frame files. If what is drawn did not change since your last identical turntable it answers unchanged (no image; that sheet is still valid); force=true renders anyway — use it if the earlier image is no longer in your context.",
      {"worker": S, "token": TOKEN, "agent": S, "agent_key": KEY, "collection": S, "objects": {"type": "array", "items": S},
-      "views": {"type": "integer"}, "size": {"type": "integer"}, "color": S, "note": NOTE, "frames": {"type": "boolean"}},
+      "views": {"type": "integer"}, "size": {"type": "integer"}, "color": S, "note": NOTE, "frames": {"type": "boolean"}, "force": {"type": "boolean"}},
      ["worker", "token", "agent"]),
     ("hub_export_collection", "Save your collection to a .blend.",
      {"worker": S, "token": TOKEN, "agent": S, "agent_key": KEY, "collection": S, "path": S, "note": NOTE},
@@ -879,14 +880,14 @@ def _short_status(st):
 
 
 def _compact_lease(lease):
+    """Only when it needs attention: lost, or expiring within 5 minutes (every call renews it anyway)."""
     if not lease:
         return None
     if not lease.get("active"):
         return {"active": False}
-    out = {"mode": lease.get("mode"), "expires_in": lease.get("expires_in")}
-    if lease.get("others"):
-        out["others"] = len(lease["others"])
-    return out
+    if (lease.get("expires_in") or 0) < 300:
+        return {"mode": lease.get("mode"), "expires_in": lease.get("expires_in")}
+    return None
 
 
 def _round_floats(v, nd=4):
@@ -945,13 +946,21 @@ def _tool_call(hub, name, args):
         shown = {k: v for k, v in res.items() if k != "frames"}
     elif name == "hub_measure":
         shown = _round_floats(res)
-    data = {"result": shown, "lease": _compact_lease(r.get("lease"))}
+    data = {"result": shown}
+    lease = _compact_lease(r.get("lease"))
+    if lease:
+        data["lease"] = lease
     for k in ("violations", "notices", "agent_key", "warning", "recycled"):
         if r.get(k):
             data[k] = r[k]
     if isinstance(res, dict) and res.get("error"):
         raise RuntimeError(json.dumps(data, ensure_ascii=False, default=str))
     img = None
+    if name == "hub_turntable" and isinstance(res, dict) and res.get("unchanged"):
+        data["result"] = {"unchanged": True, "sheet": res.get("sheet"),
+                          "note": "model unchanged since your last identical turntable: that sheet is still valid "
+                                  "(force=true to render again)"}
+        return data, None
     shot = res.get("sheet") if name == "hub_turntable" else (res.get("path") if name == "hub_screenshot" else None)
     if shot and os.path.exists(shot):
         with open(shot, "rb") as f:

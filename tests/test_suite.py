@@ -553,6 +553,76 @@ b_.location.x -= dd[0]; b_.location.y -= dd[1]; b_.location.z -= dd[2]
     tt = res(H.call(W1, "turntable", token=a, agent="A", objects=["rock_A_0"], views=12, size=256, color="VERTEX", tag="turntable"), "turntable")
     R["perf"]["turntable_12_s"] = round(time.perf_counter() - t0, 2)
     check("turntable: 12 frames + contact sheet", tt and len(tt["frames"]) == 12 and os.path.exists(tt["sheet"]), tt)
+    # tokens without losing quality: an identical turntable of an unchanged model is not re-rendered/re-sent,
+    # but ANY change the sheet depends on (geometry, material, transform) renders again; force=true always renders
+    base = res(H.call(W1, "turntable", token=a, agent="A", objects=["rock_A_0"], views=12, size=256, color="VERTEX"), "tt base")
+    same = res(H.call(W1, "turntable", token=a, agent="A", objects=["rock_A_0"], views=12, size=256, color="VERTEX"), "tt same")
+    res(ex(W1, a, "A", "m = bpy.data.objects['rock_A_0'].material_slots[0].material; m.diffuse_color = (0.9, 0.2, 0.2, 1)"), "mat color")
+    after_mat = res(H.call(W1, "turntable", token=a, agent="A", objects=["rock_A_0"], views=12, size=256, color="VERTEX"), "tt mat")
+    res(ex(W1, a, "A", "bpy.data.objects['rock_A_0'].data.vertices[0].co.z += 0.2"), "vertex edit")
+    after_geo = res(H.call(W1, "turntable", token=a, agent="A", objects=["rock_A_0"], views=12, size=256, color="VERTEX"), "tt geo")
+    forced = res(H.call(W1, "turntable", token=a, agent="A", objects=["rock_A_0"], views=12, size=256, color="VERTEX", force=True), "tt force")
+    check("turntable reuse: unchanged -> no render; material or vertex change -> new render; force -> new render",
+          same and same.get("unchanged") and after_mat and not after_mat.get("unchanged")
+          and after_geo and not after_geo.get("unchanged") and forced and not forced.get("unchanged"),
+          [bool(x and x.get("unchanged")) for x in (base, same, after_mat, after_geo, forced)])
+    # what Workbench DRAWS: a boolean cutter OUTSIDE the target list, a curve bevel, and textures must never reuse
+    res(ex(W1, a, "A", """
+bpy.ops.mesh.primitive_cube_add(size=2, location=(0, -50, 0)); wall = bpy.context.object; wall.name = 'wall'
+bpy.ops.mesh.primitive_cube_add(size=0.8, location=(0, -50, 1)); cut = bpy.context.object; cut.name = 'cutter'
+m = wall.modifiers.new('cut', 'BOOLEAN'); m.object = cut; m.operation = 'DIFFERENCE'
+bpy.ops.curve.primitive_bezier_curve_add(location=(0, -60, 0)); bpy.context.object.name = 'pipe'
+bpy.context.object.data.bevel_depth = 0.05
+"""), "boolean + curve")
+    tt_args = dict(token=a, agent="A", views=12, size=128, color="VERTEX")
+    res(H.call(W1, "turntable", objects=["wall"], **tt_args), "wall 1")
+    res(ex(W1, a, "A", "bpy.data.objects['cutter'].location.x += 0.6"), "move cutter")
+    wall2 = res(H.call(W1, "turntable", objects=["wall"], **tt_args), "wall 2")
+    res(H.call(W1, "turntable", objects=["pipe"], **tt_args), "pipe 1")
+    res(ex(W1, a, "A", "bpy.data.objects['pipe'].data.bevel_depth = 0.2"), "bevel")
+    pipe2 = res(H.call(W1, "turntable", objects=["pipe"], **tt_args), "pipe 2")
+    # a self-contained mesh WITH a modifier still reuses; a render-only change (render_levels) renders again
+    res(ex(W1, a, "A", "bpy.ops.mesh.primitive_cube_add(location=(0, -70, 0)); o = bpy.context.object; o.name = 'smooth'\n"
+                       "s = o.modifiers.new('subd', 'SUBSURF'); s.levels = 0; s.render_levels = 1"), "subsurf cube")
+    res(H.call(W1, "turntable", objects=["smooth"], **tt_args), "smooth 1")
+    sm2 = res(H.call(W1, "turntable", objects=["smooth"], **tt_args), "smooth 2")
+    res(ex(W1, a, "A", "bpy.data.objects['smooth'].modifiers['subd'].render_levels = 3"), "render levels only")
+    sm3 = res(H.call(W1, "turntable", objects=["smooth"], **tt_args), "smooth 3")
+    check("turntable reuse: self-contained mesh with a modifier reuses; a render-only change (render_levels) renders again",
+          sm2 and sm2.get("unchanged") and sm3 and not sm3.get("unchanged"),
+          [bool(x and x.get("unchanged")) for x in (sm2, sm3)])
+    wall3 = res(H.call(W1, "turntable", objects=["wall"], **tt_args), "wall 3")
+    pipe3 = res(H.call(W1, "turntable", objects=["pipe"], **tt_args), "pipe 3")
+    check("turntable reuse is off for meshes depending on other objects (boolean) and for non-mesh targets (curve)",
+          wall3 and not wall3.get("unchanged") and pipe3 and not pipe3.get("unchanged"),
+          [bool(x and x.get("unchanged")) for x in (wall3, pipe3)])
+    tex1 = res(H.call(W1, "turntable", objects=["pipe"], token=a, agent="A", views=12, size=128, color="TEXTURE"), "tex 1")
+    tex2 = res(H.call(W1, "turntable", objects=["pipe"], token=a, agent="A", views=12, size=128, color="TEXTURE"), "tex 2")
+    check("turntable reuse sees what is DRAWN: moved boolean cutter outside the list, curve bevel -> new render; TEXTURE never reuses",
+          wall2 and not wall2.get("unchanged") and pipe2 and not pipe2.get("unchanged") and tex2 and not tex2.get("unchanged"),
+          [bool(x and x.get("unchanged")) for x in (wall2, pipe2, tex1, tex2)])
+    # hub_exec with a saved script + args (edit the file instead of re-sending the code)
+    spath = os.path.join(TMP, "build_step.py")
+    with open(spath, "w", encoding="utf-8") as f:
+        f.write("bpy.ops.mesh.primitive_cube_add(size=args.get('s', 1), location=(0, -30, 0))\n"
+                "bpy.context.object.name = 'scripted'\nresult = round(bpy.context.object.dimensions.x, 3)\n")
+    r = ex(W1, a, "A", None, script=spath, args={"s": 2.5})
+    r_none = H.call(W1, "exec", token=a, agent="A", agent_key=KEYS.get("A"))
+    with open(spath, "w", encoding="utf-8") as f:
+        f.write("x = 1\nraise ValueError('script line 2')\n")
+    r_err = ex(W1, a, "A", None, script=spath)
+    check("hub_exec script=<file> with args runs the file; neither code nor script is refused; script errors show the line",
+          r["ok"] and r["result"]["result"] == 2.5 and not r_none["ok"]
+          and "raise ValueError('script line 2')" in ((r_err.get("result") or {}).get("error") or ""),
+          (r.get("result"), r_none.get("error"), (r_err.get("result") or {}).get("error", "")[-200:]))
+    with open(spath, "w", encoding="utf-8-sig") as f:  # BOM, as PowerShell 5.1 writes it
+        f.write("result = (2 + 2, __file__.endswith('build_step.py'))\n")
+    r_bom = ex(W1, a, "A", None, script=spath)
+    r_rel = H.call(W1, "exec", token=a, agent="A", agent_key=KEYS.get("A"), script="build_step.py")
+    r_both = H.call(W1, "exec", token=a, agent="A", agent_key=KEYS.get("A"), script=spath, code="result = 1")
+    check("script: BOM file runs (with __file__); relative path and code+script together are refused",
+          r_bom["ok"] and r_bom["result"].get("result") == [4, True] and not r_rel["ok"] and "absolute" in r_rel["error"]
+          and not r_both["ok"] and "not both" in r_both["error"], (r_bom.get("result"), r_rel.get("error"), r_both.get("error")))
     r = ex(W1, a, "A", f"""
 img = bpy.data.images.load(r'{tt['sheet'] if tt else ''}', check_existing=False)
 px = np.empty(len(img.pixels), dtype=np.float32); img.pixels.foreach_get(px)
@@ -941,6 +1011,13 @@ bpy.app.timers.register(_edit_like_user, first_interval=8.0)
     check("mcp: ping replies before the turntable finishes (concurrent)", ping_first)
     imgs = [cc for cc in (t5 or {}).get("result", {}).get("content", []) if cc.get("type") == "image"]
     check("mcp: turntable returns the contact sheet as an image", len(imgs) == 1 and len(imgs[0]["data"]) > 1000)
+    send({"jsonrpc": "2.0", "id": 50, "method": "tools/call", "params": {"name": "hub_turntable", "arguments": {
+        "worker": mw, "token": mt, "agent": "M", "collection": "Agent_M", "views": 12, "size": 320}}})
+    t50 = wait(50)
+    c50 = (t50 or {}).get("result", {}).get("content", [])
+    txt50 = "".join(cc.get("text", "") for cc in c50)
+    check("mcp: repeated unchanged turntable answers 'unchanged' with no image; no lease block while it is healthy",
+          not any(cc.get("type") == "image" for cc in c50) and '"unchanged":true' in txt50 and '"lease"' not in txt50, txt50[:200])
     if imgs:
         with open(os.path.join(TMP, "mcp_sheet.png"), "wb") as f:
             f.write(base64.b64decode(imgs[0]["data"]))

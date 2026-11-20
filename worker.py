@@ -53,7 +53,7 @@ try:
 except Exception:
     np = None
 
-VERSION = "0.10.0"
+VERSION = "0.11.0"
 LEASE_TTL_DEFAULT = 900.0
 LEASE_TTL_MAX = 3600.0
 NET_CMDS = {"ping", "status", "check_token"}   # answered outside the queue, without bpy
@@ -907,7 +907,7 @@ def _module_specs():
 
 
 MODULE_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
-RESERVED_NAMES = {"bpy", "bmesh", "mathutils", "np", "math", "agent", "coll", "link", "result"}
+RESERVED_NAMES = {"bpy", "bmesh", "mathutils", "np", "math", "agent", "coll", "link", "result", "args"}
 
 
 AGENT_MODS = {}  # (module name, agent) -> (mtime, globals dict): every agent gets its own instance
@@ -996,7 +996,26 @@ def cmd_exec(req):
     buf = io.StringIO()
     err = None
     timeout = min(max(float(req.get("timeout", 120)), 1.0), 1800.0)
-    code = compile(req["code"], f"<exec {agent}>", "exec")
+    if req.get("script") and req.get("code"):
+        raise ValueError("pass either `code` or `script`, not both")
+    if req.get("script"):  # a saved .py file: agents edit the file instead of re-sending the whole code
+        raw = str(req["script"])
+        if not os.path.isabs(raw):
+            raise ValueError(f"script must be an absolute path (relative paths resolve inside the Blender process): {raw}")
+        spath = os.path.abspath(raw)
+        if not spath.lower().endswith(".py") or not os.path.isfile(spath):
+            raise ValueError(f"script must be an existing .py file: {spath}")
+        with open(spath, encoding="utf-8-sig") as f:  # -sig: files saved by PowerShell 5.1 / some editors carry a BOM
+            src = f.read()
+        fname = f"<exec {agent}: {spath}>"
+        linecache.cache[fname] = (len(src), None, src.splitlines(True), fname)  # tracebacks show the script's lines
+        ns["__file__"] = spath
+    elif req.get("code"):
+        src, fname = req["code"], f"<exec {agent}>"
+    else:
+        raise ValueError("hub_exec needs `code` or `script`")
+    ns["args"] = req.get("args") or {}
+    code = compile(src, fname, "exec")
     with contextlib.redirect_stdout(buf):
         try:
             _run_guarded(lambda: exec(code, ns), timeout)
@@ -1092,13 +1111,112 @@ def cmd_measure(req):
             "sample_spacing": round(used_tol, 4)}
 
 
+TT_CACHE = {}  # (agent, target, params) -> (fingerprint, result): a repeated turntable of an unchanged model
+
+
+TT_CACHE_MAX = 50
+
+
+def _tt_fingerprint(obs, color):
+    """Fingerprint of WHAT WORKBENCH DRAWS for self-contained meshes: the evaluated mesh of every target, all its
+    modifier settings (render-only too), world matrix, mesh and object-linked materials, plus the scene display
+    settings. Returns None (= always render) unless every target is a MESH with no particles, no Geometry Nodes
+    and no modifier pointing at another object/collection (curves, text, metaballs, booleans with outside cutters
+    always render), and also for TEXTURE color or when a target is instanced."""
+    if str(color).upper() == "TEXTURE":
+        return None
+    # Reuse only for SELF-CONTAINED meshes: anything whose render can depend on data outside the target's own
+    # mesh/modifiers (curves/text/metaballs with render resolutions, particle hair, Geometry Nodes, modifiers
+    # pointing at other objects or collections) always renders. Quality first: never a stale sheet.
+    for ob in obs:
+        if ob.type != "MESH" or len(ob.particle_systems):
+            return None
+        for m in ob.modifiers:
+            if m.type == "NODES":
+                return None
+            for p in m.bl_rna.properties:
+                if p.type == "POINTER" and p.identifier != "rna_type":
+                    v = getattr(m, p.identifier, None)
+                    if isinstance(v, (bpy.types.Object, bpy.types.Collection)):
+                        return None
+    dg = bpy.context.evaluated_depsgraph_get()
+    dg.update()
+    names = {o.name for o in obs}
+    for inst in dg.object_instances:
+        if inst.is_instance and inst.parent is not None and inst.parent.original.name in names:
+            return None
+    sc = bpy.context.scene
+    parts = [_rna_props(sc.display.shading), _rna_props(sc.display), _rna_props(sc.view_settings)]
+    for ob in sorted(obs, key=lambda o: o.name):
+        ev = ob.evaluated_get(dg)
+        me = ev.to_mesh()
+        try:
+            if me is None:
+                return None
+            nv, nl, npoly = len(me.vertices), len(me.loops), len(me.polygons)
+            mesh_parts = [nv, nl, npoly, _arr(me.vertices, "co", nv, 3), _arr(me.loops, "vertex_index", nl, 1, "i"),
+                          _arr(me.polygons, "material_index", npoly, 1, "i")]
+            for at in me.attributes:  # vertex colors / UVs / sharp flags as drawn
+                if at.name.startswith(".") and at.name not in (".corner_vert", ".edge_verts"):
+                    continue
+                field, w = _ATTR_FIELD.get(at.data_type, ("value", 1))
+                dt = "i" if at.data_type in ("INT", "INT8", "INT32_2D") else ("b" if at.data_type == "BOOLEAN" else "f")
+                mesh_parts += [at.name, at.domain, at.data_type, _arr(at.data, field, len(at.data), w, dt)]
+            # mesh materials AND object-linked slots (link='OBJECT' overrides the mesh at draw time)
+            mats = (tuple(_material_hash(m) if m else None for m in me.materials),
+                    tuple((s.link, _material_hash(s.material) if s.material else None) for s in ev.material_slots))
+            # render-only settings (render_levels, show_render, GN "Is Viewport" branches) do not change the
+            # viewport-evaluated mesh above, but they change what render.render() draws: hash them too
+            src = ob.original if hasattr(ob, "original") else ob
+            mods = []
+            for m in src.modifiers:
+                mods.append((m.name, m.type, _rna_props(m)))
+                if m.type == "NODES":
+                    mods.append(_gn_inputs(m))
+                    if m.node_group:
+                        mods.append(_tree_hash(m.node_group, set()))
+            parts.append((ob.name, _h(*mesh_parts), tuple(round(v, 5) for row in ev.matrix_world for v in row), mats,
+                          ev.hide_render, tuple(ev.color), _h(*mods)))
+        finally:
+            with contextlib.suppress(Exception):
+                ev.to_mesh_clear()
+    return _h(*parts)
+
+
 def cmd_turntable(req):
-    """Review turntable: N frames around the target, from low to high, + contact sheet."""
+    """Review turntable: N frames around the target, from low to high, + contact sheet.
+
+    If nothing the sheet depends on changed since this agent's last identical turntable, it returns
+    {"unchanged": true, ...} without rendering (force=true renders anyway)."""
     obs = _targets(req)
     n = int(req.get("views", 12))
     if n < 1 or n > 48:
         raise ValueError("views must be between 1 and 48")
     size = min(max(int(req.get("size", 256)), 64), 1024)
+    isolate_req = req.get("isolate", True)
+    key = (req["_agent"], tuple(sorted(o.name for o in obs)), n, size, str(req.get("color", "MATERIAL")),
+           str(req.get("elev")), bpy.context.scene.frame_current)
+    # no reuse without isolation (other objects show) or with a caller-chosen tag/out_dir (the file may be overwritten)
+    reusable = isolate_req and not req.get("tag") and not req.get("out_dir")
+    fp = None
+    if reusable:
+        try:
+            fp = _tt_fingerprint(obs, req.get("color", "MATERIAL"))
+        except Exception:
+            fp = None  # cannot prove it unchanged: render
+    cached = TT_CACHE.get(key)
+    if (fp and not req.get("force") and cached and cached[0] == fp and cached[1].get("sheet")
+            and os.path.exists(cached[1]["sheet"]) and os.path.getmtime(cached[1]["sheet"]) == cached[2]):
+        return dict(cached[1], unchanged=True)
+    result = _turntable_render(req, obs, n, size)
+    if fp and result.get("sheet") and os.path.exists(result["sheet"]):
+        TT_CACHE[key] = (fp, result, os.path.getmtime(result["sheet"]))
+        while len(TT_CACHE) > TT_CACHE_MAX:
+            TT_CACHE.pop(next(iter(TT_CACHE)))
+    return result
+
+
+def _turntable_render(req, obs, n, size):
     out_dir = req.get("out_dir") or os.path.join(ARGS["state"], "renders", ARGS["name"])
     os.makedirs(out_dir, exist_ok=True)
     tag = f"{req['_agent']}_{re.sub(r'[^A-Za-z0-9_-]', '', str(req.get('tag') or int(time.time() * 1000)))}"

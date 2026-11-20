@@ -165,10 +165,10 @@ For fully independent tasks (10 different assets), give each agent its own **exc
 | `hub_acquire` | Get a free worker from the pool (or start one) and lease it. Opens a window by default. Args: `mode`, `label`, `blend`, `ttl`, `gui` (default true). Returns `worker`, `token`. |
 | `hub_lease` | Join a specific worker (e.g. a shared scene). Default `mode` is `exclusive`; pass `shared` to join others. Returns a token. |
 | `hub_renew` / `hub_release` | Renew / release only your own lease. |
-| `hub_exec` | Run Python in Blender as `agent` (required). Args: `code`, `timeout`, `agent_key`, `note` (what this step does, shown live). |
+| `hub_exec` | Run Python in Blender as `agent` (required): `code`, or `script` (absolute path to a saved `.py`, BOM ok, `__file__` set; not both) with `args` (a dict, available as `args`). Also `timeout`, `agent_key`, `note` (what this step does, shown live). |
 | `hub_note` | Declare the task you are working on (`task`); shown live in the window's panel and in `hub_list_workers`. |
 | `hub_measure` | Min distance, intersecting faces, penetration (ray-parity), manifold flags and `delta_a_to_b` between two objects. `tol` = edge sample spacing. |
-| `hub_turntable` | N renders around the target (Workbench) + a contact sheet returned as an image. `agent` required; `views` 1–48 (default 12), `size` 64–1024 (default 256). |
+| `hub_turntable` | N renders around the target (Workbench) + a contact sheet returned as an image. `agent` required; `views` 1–48 (default 12), `size` 64–1024 (default 256). An identical turntable of an unchanged model answers `unchanged` without an image; `force=true` renders anyway. |
 | `hub_view` | Window mode: frame the viewport on a collection/objects (keeps the user's selection). |
 | `hub_screenshot` | Window mode: what the user sees — by default only the 3D viewport, longest side `size` px (1024); `full=true` for the whole window. Returned as an image. |
 | `hub_export_collection` | Save your collection to a `.blend`. `agent` required. |
@@ -212,7 +212,7 @@ Point `BLENDER_HUB_MODULES` at Python files and every worker loads them into the
 ```powershell
 powershell -ExecutionPolicy Bypass -File install.ps1 -ClaudeDesktop -Module "K=C:\path\to\my_kit.py" -Test -Yes
 ```
-- Format of the env var: `NAME=PATH` entries separated by `;` (`NAME` defaults to the file stem; ASCII letters, digits and `_`; `bpy`, `bmesh`, `mathutils`, `np`, `math`, `agent`, `coll`, `link`, `result` are reserved). Installer: repeat `--module NAME=PATH` for `install.py`, or give a comma list to `install.ps1 -Module "K=a.py","L=b.py"`. Each file is executed into its own dict, exactly like `K = {}; exec(open(path).read(), K)`, so code written for that pattern works unchanged: `K["Builder"](...)`.
+- Format of the env var: `NAME=PATH` entries separated by `;` (`NAME` defaults to the file stem; ASCII letters, digits and `_`; `bpy`, `bmesh`, `mathutils`, `np`, `math`, `agent`, `coll`, `link`, `result`, `args` are reserved). Installer: repeat `--module NAME=PATH` for `install.py`, or give a comma list to `install.ps1 -Module "K=a.py","L=b.py"`. Each file is executed into its own dict, exactly like `K = {}; exec(open(path).read(), K)`, so code written for that pattern works unchanged: `K["Builder"](...)`.
 - A changed file is reloaded on the next `hub_exec` (loading has a 60 s watchdog); a broken file, an invalid or a reserved name is reported in `hub_list_workers` (`modules`) and never blocks `hub_exec`.
 - Every agent gets **its own instance** of each module (executed once per agent and file version): `K` is the kit functions' own globals, so `K["SCALE"] = 2; K["build"]()` works as in the plain pattern, and nothing an agent sets in its `K` reaches other agents. Modules must not change the scene when they are loaded.
 
@@ -244,7 +244,7 @@ Environment variables (set them in the MCP entry's `env`):
 ```powershell
 python tests\test_suite.py --max-workers 10 --jobs 20
 ```
-Uses its own state folder and ports **9981+**, so it never touches real workers or your Blender. It starts up to 10 Blenders (needs ~3 GB free RAM), briefly opens a few visible Blender windows (window-mode and MCP-default checks), and takes about 4 minutes. 137 checks: pool, identity, leases, 18 kinds of cross-agent changes, false-alarm cases, watchdog, kill, autosave/restore, measure accuracy, turntable, window mode, MCP stdio protocol. Results go to `tests/results/`.
+Uses its own state folder and ports **9981+**, so it never touches real workers or your Blender. It starts up to 10 Blenders (needs ~3 GB free RAM), briefly opens a few visible Blender windows (window-mode and MCP-default checks), and takes about 4 minutes. 144 checks: pool, identity, leases, 18 kinds of cross-agent changes, false-alarm cases, watchdog, kill, autosave/restore, measure accuracy, turntable, window mode, MCP stdio protocol. Results go to `tests/results/`.
 
 ## Token budget
 Images cost tokens by pixel count and stay in the conversation, so the hub keeps them small; text replies are compact JSON. Measured with `python tests/token_budget.py` (a typical modeling session: 1 acquire, 1 note, 25 exec, 4 turntables, 4 screenshots, 2 status calls; each reply counted once — images stay in the conversation, so their real cumulative cost is higher, which makes the image savings matter more):
@@ -258,7 +258,12 @@ Images cost tokens by pixel count and stay in the conversation, so the hub keeps
 | tool definitions + instructions | ~3,100 | ~2,560 |
 | **typical session** | **~21,300** | **~11,100** |
 
-Tips for agents: review with one `hub_turntable` instead of several screenshots, call `hub_screenshot` only when you need to see what the user sees, and keep `result` small (return counts and names, not whole meshes).
+0.11.0 adds savings that do not touch quality (same views, same resolution, same review):
+- **Repeated turntable of an unchanged model**: ~1,090 → ~70 tokens. Reuse happens only when every target is a **self-contained mesh** (no particle hair, no Geometry Nodes, no modifier pointing at another object or collection) and nothing it draws changed: its evaluated mesh and attributes, every modifier setting (render-only ones included), world matrix, mesh and object-linked materials with all their nodes, and the scene display settings. Anything else — curves, text, metaballs, booleans with outside cutters, `color="TEXTURE"`, `isolate=false`, a custom `tag`/`out_dir` — always renders. `force=true` always renders (use it if the earlier image is no longer in your context).
+- **`hub_exec(script=..., args=...)`**: keep a build script in a file and edit only what changes between attempts instead of re-sending hundreds of lines of code each time (the code an agent writes usually costs more than any reply).
+- **Replies without the lease block** while the lease is healthy (it appears when it expires in < 5 min or is lost): `hub_exec` replies ~22 → ~10 tokens.
+
+Tips for agents: review with one `hub_turntable` instead of several screenshots, call `hub_screenshot` only when you need to see what the user sees, use the preloaded kit (`K`) and `script=` for long builds, and keep `result` small (return counts and names, not whole meshes).
 
 ## How it works / limits
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the design, the guarantees and the known limits (no undo in background Blender, C calls cannot be interrupted, scene-wide settings are shared, detection cost ≈ 45 ms per command with 20k vertices owned by others).

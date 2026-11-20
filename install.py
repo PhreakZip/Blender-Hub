@@ -283,7 +283,7 @@ def main():
             name, _, path = m.partition("=")
             if not path or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
                 fail(f"--module must be NAME=PATH (NAME: ASCII letters, digits, _): {m!r}")
-            if name in ("bpy", "bmesh", "mathutils", "np", "math", "agent", "coll", "link", "result"):
+            if name in ("bpy", "bmesh", "mathutils", "np", "math", "agent", "coll", "link", "result", "args"):
                 fail(f"--module name {name!r} is reserved (hub_exec built-in)")
             path = os.path.abspath(path)
             if not os.path.isfile(path):

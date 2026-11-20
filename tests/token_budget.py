@@ -111,6 +111,12 @@ def _run(rpc, call, out):
                                   code="bpy.ops.mesh.primitive_ico_sphere_add(subdivisions=3, location=(3,0,0)); bpy.context.object.name='rock'; result = {'faces': len(bpy.context.object.data.polygons)}"))
     measure("hub_measure", call("hub_measure", worker=w, token=t, a="Cube", b="rock"))
     measure("hub_turntable_12", call("hub_turntable", worker=w, token=t, agent="A", collection="Agent_A", views=12))
+    measure("hub_turntable_repeat", call("hub_turntable", worker=w, token=t, agent="A", collection="Agent_A", views=12))
+    sp = os.path.join(STATE, "budget_step.py")
+    os.makedirs(STATE, exist_ok=True)
+    with open(sp, "w", encoding="utf-8") as f:
+        f.write("bpy.ops.mesh.primitive_cube_add(size=args['s'], location=(0, 5, 0)); result = 1\n")
+    measure("hub_exec_script", call("hub_exec", worker=w, token=t, agent="A", script=sp, args={"s": 2}, note="scripted"))
     measure("hub_screenshot", call("hub_screenshot", worker=w, token=t))
     measure("hub_list_workers_1", call("hub_list_workers"))
     measure("hub_release", call("hub_release", worker=w, token=t))
