@@ -12,7 +12,8 @@ Built for Claude (Desktop / Code) and any MCP client. Windows only. No dependenc
 | Review renders | One viewport capture per call | `hub_turntable`: 12 views + one contact sheet in ~1 s |
 | Fitting parts together | Guess coordinates | `hub_measure`: distance, intersection, penetration and the exact move to make them touch |
 | Crash / forgotten agent | Work lost | Rotating autosaves, archives, `hub_restart_worker`, `hub_restore_archive` |
-| Watch live | Yes (one window) | Yes, by default: one window per session, with `hub_view` / `hub_screenshot` |
+| Watch live | Yes (one window) | Yes, by default: one window per session, with `hub_view` / `hub_screenshot` and a live panel of who is working |
+| Shared helper code | Pasted into every call | `BLENDER_HUB_MODULES`: your kit is preloaded in every `hub_exec` and reloaded when the file changes |
 
 ---
 
@@ -116,7 +117,7 @@ powershell -ExecutionPolicy Bypass -File install.ps1 -ClaudeDesktop -Uninstall -
 ## For AI assistants: how to use the tools
 ### The workflow
 ```
-hub_acquire(mode="exclusive" | "shared", label="what you are doing")
+hub_acquire(mode="exclusive" | "shared", label="what you are doing")   # label is required: it is shown live
       -> {worker, token}                       # opens a Blender window the user watches; keep BOTH for the whole task
 hub_exec(worker, token, agent="YourName", code="...")
       -> first call also returns agent_key     # keep it: needed to resume the agent later
@@ -128,6 +129,7 @@ hub_release(worker, token)   # when you are done
 
 ### Rules that matter
 - **Always pass `token`**, and pass the **same `agent` name** to `hub_exec`, `hub_turntable` and `hub_export_collection` for the whole task (they create/bind your agent; add `agent_key` when resuming). Store `worker`, `token` and `agent_key` somewhere you will not lose them (e.g. your notes/plan). If your context gets summarized, you need them to continue.
+- **Always give a `label`** (what you are doing, e.g. `"castle walls v2"`): it identifies your session in the window's live panel and in `hub_list_workers`. A lease created without one (Python API) takes the name of its first agent.
 - **Leases:** `hub_lease` / `hub_acquire` default to `mode="exclusive"` — pass `mode="shared"` to join a shared scene. A lease lasts `ttl` seconds (default 900, max 3600) and every call renews it; an agent idle for longer loses it.
 - **`hub_exec` runs Python inside Blender** with `bpy`, `bmesh`, `mathutils`, `np`, `math` available, plus:
   - `coll` — your collection `Agent_<agent>`; `bpy.ops` that create objects put them there automatically;
@@ -144,7 +146,7 @@ hub_release(worker, token)   # when you are done
 - **Reviewing your work:** `hub_turntable(worker, token, agent="<you>", collection="Agent_<you>", views=12)` returns one contact-sheet image with 12 angles (low to high). Use it instead of many single captures.
 - **Live by default:** `hub_acquire` / `hub_start_worker` open a Blender **window** unless you pass `gui=false` (server default `BLENDER_HUB_GUI_DEFAULT=1`). One window per session: call `hub_view(collection=...)` after a meaningful step so the user's viewport frames your work, and `hub_screenshot` to see exactly what they see. Use `gui=false` for background or many-parallel batch work.
 - **When you finish:** `hub_release`, then ask the user whether to close the window (`hub_stop_worker`). Windows never close on their own, are never recycled, and count against both the pool limit (10) and the window cap (4); when a limit is hit, the error lists the open windows to close.
-- **Errors are actionable**: `your lease expired` → `hub_lease(worker, mode=<your original mode>)` for a new token, then pass `agent_key` in your next `hub_exec` / `hub_turntable` / `hub_export_collection`; `requires a valid lease token ... was RECYCLED ...` → `hub_restore_archive(archive)`; `already exists: resuming it requires its agent_key` → use your key, or `hub_agent_key` with a token that still uses the agent.
+- **Errors are actionable**: `your lease expired` → `hub_lease(worker, mode=<your original mode>, label=...)` for a new token, then pass `agent_key` in your next `hub_exec` / `hub_turntable` / `hub_export_collection`; `requires a valid lease token ... was RECYCLED ...` → `hub_restore_archive(archive)`; `already exists: resuming it requires its agent_key` → use your key, or `hub_agent_key` with a token that still uses the agent.
 - Never stop or kill a worker another session is using; the hub refuses, so do not try to work around it.
 
 ### Typical multi-agent setup
@@ -188,6 +190,24 @@ Window mode is the default for the MCP tools (`gui=false` or `BLENDER_HUB_GUI_DE
 
 In window mode **you own everything**: your manual edits are not reported as violations.
 
+**Live panel.** Every window shows, at the bottom-left of the 3D viewport (like Blender's own statistics overlay), how many agents are working in that Blender and who they are, updated every second:
+```
+Blender Hub  w1  |  3 agents working
+castle    ·  running exec 3s  ·  lease 'castle walls v2' exclusive            (green: running now)
+walls     ·  active, last command 12s ago  ·  lease 'walls' shared            (white: active in the last minute)
+props     ·  idle 6m  ·  lease 'props pass' shared                            (grey: idle)
+```
+The same lines are in `hub_list_workers` (`overlay`). Turn it off with `BLENDER_HUB_OVERLAY=0`.
+
+## Shared modules (your kit in every hub_exec)
+Point `BLENDER_HUB_MODULES` at Python files and every worker loads them into the `hub_exec` namespace — no more pasting a 2000-line helper kit into each call:
+```powershell
+powershell -ExecutionPolicy Bypass -File install.ps1 -ClaudeDesktop -Module "K=C:\path\to\my_kit.py" -Test -Yes
+```
+- Format of the env var: `NAME=PATH` entries separated by `;` (`NAME` defaults to the file stem; ASCII letters, digits and `_`; `bpy`, `bmesh`, `mathutils`, `np`, `math`, `agent`, `coll`, `link`, `result` are reserved). Installer: repeat `--module NAME=PATH` for `install.py`, or give a comma list to `install.ps1 -Module "K=a.py","L=b.py"`. Each file is executed into its own dict, exactly like `K = {}; exec(open(path).read(), K)`, so code written for that pattern works unchanged: `K["Builder"](...)`.
+- A changed file is reloaded on the next `hub_exec` (loading has a 60 s watchdog); a broken file, an invalid or a reserved name is reported in `hub_list_workers` (`modules`) and never blocks `hub_exec`.
+- Every agent gets **its own instance** of each module (executed once per agent and file version): `K` is the kit functions' own globals, so `K["SCALE"] = 2; K["build"]()` works as in the plain pattern, and nothing an agent sets in its `K` reaches other agents. Modules must not change the scene when they are loaded.
+
 ## Configuration
 Environment variables (set them in the MCP entry's `env`):
 
@@ -196,6 +216,8 @@ Environment variables (set them in the MCP entry's `env`):
 | `BLENDER_EXE` | auto-detect | Blender executable |
 | `BLENDER_HUB_STATE` | `%LOCALAPPDATA%\blender-hub` | registry, logs, autosaves, archives, renders |
 | `BLENDER_HUB_MAX_WINDOWS` | `4` | cap on open windows (they never idle-exit) |
+| `BLENDER_HUB_MODULES` | — | `NAME=PATH;...` Python files preloaded into every `hub_exec` (see Shared modules) |
+| `BLENDER_HUB_OVERLAY` | `1` | live panel in windows (who is working); `0` hides it |
 | `BLENDER_HUB_GUI_DEFAULT` | `1` | MCP tools open a window unless `gui=false`; `0` makes background the default (the Python API always defaults to background) |
 | `BLENDER_HUB_PORT_BASE` | `9881` | first worker port (9876 is always skipped) |
 | `BLENDER_HUB_MAX_WORKERS` | `10` | pool limit |
@@ -214,7 +236,7 @@ Environment variables (set them in the MCP entry's `env`):
 ```powershell
 python tests\test_suite.py --max-workers 10 --jobs 20
 ```
-Uses its own state folder and ports **9981+**, so it never touches real workers or your Blender. It starts up to 10 Blenders (needs ~3 GB free RAM), briefly opens a few visible Blender windows (window-mode and MCP-default checks), and takes about 4 minutes. 125 checks: pool, identity, leases, 18 kinds of cross-agent changes, false-alarm cases, watchdog, kill, autosave/restore, measure accuracy, turntable, window mode, MCP stdio protocol. Results go to `tests/results/`.
+Uses its own state folder and ports **9981+**, so it never touches real workers or your Blender. It starts up to 10 Blenders (needs ~3 GB free RAM), briefly opens a few visible Blender windows (window-mode and MCP-default checks), and takes about 4 minutes. 133 checks: pool, identity, leases, 18 kinds of cross-agent changes, false-alarm cases, watchdog, kill, autosave/restore, measure accuracy, turntable, window mode, MCP stdio protocol. Results go to `tests/results/`.
 
 ## How it works / limits
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the design, the guarantees and the known limits (no undo in background Blender, C calls cannot be interrupted, scene-wide settings are shared, detection cost ≈ 45 ms per command with 20k vertices owned by others).

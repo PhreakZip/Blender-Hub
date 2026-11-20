@@ -23,6 +23,16 @@ sys.path.insert(0, ROOT)
 os.environ["BLENDER_HUB_STATE"] = os.path.join(tempfile.gettempdir(), "blender-hub-bench-state")
 os.environ["BLENDER_HUB_PORT_BASE"] = "9981"
 os.environ["BLENDER_HUB_GUI_DEFAULT"] = "1"  # the suite checks the shipped default, whatever the dev's env says
+# a module every worker loads into hub_exec (BLENDER_HUB_MODULES), plus a broken one that must not block exec
+_MODDIR = os.path.join(tempfile.gettempdir(), "blender-hub-suite-modules")
+os.makedirs(_MODDIR, exist_ok=True)
+MOD_OK = os.path.join(_MODDIR, "suite_kit.py")
+MOD_BAD = os.path.join(_MODDIR, "broken_mod.py")
+with open(MOD_OK, "w", encoding="utf-8") as _f:
+    _f.write("VALUE = 1\ndef double(x):\n    return 2 * x\ndef get_value():\n    return VALUE\n")
+with open(MOD_BAD, "w", encoding="utf-8") as _f:
+    _f.write("raise RuntimeError('broken on purpose')\n")
+os.environ["BLENDER_HUB_MODULES"] = f"KT={MOD_OK};{MOD_BAD};bad-name={MOD_OK};np={MOD_OK}"
 os.environ.setdefault("BLENDER_HUB_IDLE", "600")
 import hub as hubmod  # noqa: E402
 from hub import Hub, free_mb  # noqa: E402
@@ -355,6 +365,34 @@ def main():
     H.call(W1, "release", token=q)
     r = ex(W1, b, "B", "result = 1")
     check("lease: the reply carries the lease state", r.get("lease", {}).get("active") is True and "expires_in" in r["lease"], r.get("lease"))
+    # modules: BLENDER_HUB_MODULES loads files into every hub_exec (as `KT` and by file stem), reloads on change
+    r = ex(W1, b, "B", "result = (KT['VALUE'], KT['double'](21), 'broken_mod' in globals())")
+    st_m = H.status(W1).get("modules") or {}
+    check("modules: loaded into hub_exec under their name; a broken one is reported and does not block exec",
+          r["ok"] and r["result"]["result"] == [1, 42, False] and st_m.get("KT") == "ok"
+          and "broken on purpose" in (st_m.get("broken_mod") or ""), (r.get("result"), st_m))
+    time.sleep(1.1)  # mtime resolution
+    with open(MOD_OK, "w", encoding="utf-8") as f:
+        f.write("VALUE = 2\ndef double(x):\n    return 2 * x\ndef get_value():\n    return VALUE\n")
+    r = ex(W1, b, "B", "result = KT['VALUE']")
+    check("modules: an edited module file is reloaded on the next hub_exec", r["ok"] and r["result"]["result"] == 2, r.get("result"))
+    st_m = H.status(W1).get("modules") or {}
+    check("modules: invalid and reserved names are reported (not silently dropped)",
+          "invalid name" in (st_m.get("bad-name") or "") and "reserved" in (st_m.get("np") or ""), st_m)
+    ex(W1, b, "B", "KT['leak'] = 1")
+    r = ex(W1, a, "A", "result = 'leak' in KT")
+    check("modules: each agent gets its own instance (one agent's KT['x'] does not leak)", r["ok"] and r["result"]["result"] is False, r.get("result"))
+    r = ex(W1, b, "B", "KT['VALUE'] = 7; result = KT['get_value']()")
+    r2 = ex(W1, a, "A", "result = KT['get_value']()")
+    check("modules: configuring through K reaches the kit's own functions (K = {}; exec(src, K) pattern), per agent",
+          r["ok"] and r["result"]["result"] == 7 and r2["ok"] and r2["result"]["result"] == 2,
+          (r.get("result"), r2.get("result")))
+    un = res(H.call(W1, "lease", mode="shared"), "unnamed lease")["token"]
+    r = H.call(W1, "exec", token=un, agent="A", code="result = 1")  # A belongs to another lease: bind fails
+    labels = [p["label"] for p in H.status(W1).get("participants", [])]
+    check("unnamed lease is NOT renamed to an agent whose bind failed", not r["ok"] and "A" not in labels and "unnamed" in labels,
+          (r.get("error"), labels))
+    H.call(W1, "release", token=un)
 
     # ================= intrusion: every way of touching what belongs to someone else
     res(ex(W1, a, "A", """
@@ -705,6 +743,23 @@ bpy.data.images.remove(img)
     st_ms = (time.perf_counter() - t0) * 1000
     th.join()
     check("window: status responds during a long exec", stb.get("busy") == "exec" and st_ms < 300, round(st_ms))
+    # live panel: how many / which agents work in this window; unnamed lease takes the agent's name
+    tg2 = res(H.call("window1", "lease", mode="shared"), "unnamed lease")["token"]
+    ex("window1", tg2, "G2", "result = 1")
+    box2 = {}
+    th = threading.Thread(target=lambda: box2.update(r=ex("window1", tg2, "G2", "import time\nt=time.time()\nwhile time.time()-t<2: pass")))
+    th.start()
+    time.sleep(0.6)
+    ov = H.status("window1").get("overlay") or []
+    th.join()
+    texts = [t for t, _ in ov]
+    kinds = {t.split()[0]: k for t, k in ov[1:]} if ov else {}
+    check("live panel: title counts 2 agents, G2 shown running, G shown with its lease",
+          ov and "2 agents working" in ov[0][0] and kinds.get("G2") == "busy" and any(t.startswith("G ") and "'gui'" in t for t in texts),
+          texts)
+    labels = [p["label"] for p in H.status("window1").get("participants", [])]
+    check("unnamed lease is named after its first agent", "G2" in labels, labels)
+    H.call("window1", "release", token=tg2)
     vw = H.call("window1", "view", token=tg, collection="Agent_G", shading="MATERIAL")
     sh = H.call("window1", "screenshot", token=tg)
     sp = (sh.get("result") or {}).get("path")
@@ -735,23 +790,25 @@ result = bpy.context.mode
     while time.time() - t0 < 12 and not hubmod._blends(adir_g):
         time.sleep(0.5)
     check("window: autosave written a few seconds after the change", hubmod._blends(adir_g), round(time.time() - t0, 1))
-    # a "user" edit (outside any agent command: Blender's own timer) also goes into the autosave
-    time.sleep(6)
-    n_before = len(hubmod._blends(adir_g))
+    # a "user" edit (outside any agent command: Blender's own timer) also goes into the autosave.
+    # The edit fires 8 s after the agent's command, so the agent's own autosave is already out; then a NEWER
+    # autosave must appear after the edit (only the user-edit handler can cause it).
     res(ex("window1", tg, "G", """
 def _edit_like_user():
     bpy.data.objects['Suzanne'].location.x += 2.0
     return None
-bpy.app.timers.register(_edit_like_user, first_interval=1.0)
+bpy.app.timers.register(_edit_like_user, first_interval=8.0)
 """), "schedule user edit")
-    time.sleep(1)  # the agent's command is over; its autosave may go out now
+    t_edit = time.time() + 8.0
+
+    def newest():
+        fs = [os.path.join(adir_g, f) for f in os.listdir(adir_g) if f.endswith(".blend")]
+        return max((os.path.getmtime(f) for f in fs), default=0)
     t0 = time.time()
-    n_mid = len(hubmod._blends(adir_g))
-    while time.time() - t0 < 15 and len(hubmod._blends(adir_g)) <= max(n_mid, n_before + 1):
+    while time.time() - t0 < 30 and newest() <= t_edit + 0.2:
         time.sleep(0.5)
     check("window: an edit made outside the agent's commands also goes into the autosave",
-          len(hubmod._blends(adir_g)) > max(n_mid, n_before + 1) or (len(hubmod._blends(adir_g)) >= 20),
-          (n_before, n_mid, len(hubmod._blends(adir_g))))
+          newest() > t_edit + 0.2, round(newest() - t_edit, 1))
     # recycling never closes the window
     H.call("window1", "release", token=tg)
     rec = _safe(lambda: H._recycle_one({"window1": H.workers()["window1"]}))

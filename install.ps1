@@ -18,6 +18,7 @@ param(
   [switch]$Uninstall,
   [switch]$Yes,
   [switch]$Background,
+  [string[]]$Module,
   [string]$Blender,
   [string]$Config,
   [string]$Name = "blender-hub"
@@ -63,6 +64,7 @@ if ($Test)          { $a += "--test" }
 if ($Uninstall)     { $a += "--uninstall" }
 if ($Yes)           { $a += "--yes" }
 if ($Background)    { $a += "--background" }
+foreach ($m in $Module) { $a += @("--module", $m) }
 if ($Blender)       { $a += @("--blender", $Blender) }
 if ($Config)        { $a += @("--config", $Config) }
 $a += @("--name", $Name)

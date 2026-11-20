@@ -24,7 +24,7 @@ import subprocess
 import threading
 import contextlib
 
-VERSION = "0.7.0"
+VERSION = "0.8.0"
 HERE = os.path.dirname(os.path.abspath(__file__))
 WORKER = os.path.join(HERE, "worker.py")
 sys.path.insert(0, HERE)
@@ -594,7 +594,7 @@ class Hub:
         if not free:
             return ""
         return (" | open windows with no lease: " + ", ".join(f"{w['name']} (idle {w['idle_min']} min)" for w in free)
-                + ": ask the user to close one (hub_stop_worker name=...), keep working in one with hub_lease(worker=name), "
+                + ": ask the user to close one (hub_stop_worker name=...), keep working in one with hub_lease(worker=name, label=..., mode=\"shared\" if it has leases), "
                   "or use gui=false")
 
     def check_window_cap(self):
@@ -603,13 +603,13 @@ class Hub:
             raise RuntimeError(f"window limit of {MAX_WINDOWS} reached (BLENDER_HUB_MAX_WINDOWS): "
                                + ", ".join(f"{w['name']} (leases {w['leases']}, idle {w['idle_min']} min)" for w in wins)
                                + " | ask the user to close a window they no longer watch (hub_stop_worker name=...), "
-                                 "keep working in an existing one with hub_lease(worker=name), "
+                                 "keep working in an existing one with hub_lease(worker=name, label=..., mode=\"shared\" if it has leases), "
                                  "or pass gui=false to work in the background"
                                + " (the cap can be exceeded by one when two sessions open windows at the same instant)")
 
     def acquire(self, mode="exclusive", label=None, blend=None, ttl=900, gui=False):
         """Pool: takes a free worker (no lease) or boots a new one, and leases it."""
-        label = label or "agent"
+        # no label: the worker names the lease after its first agent
         reg = self.workers(clean=True)
         for name in sorted(reg):
             try:
@@ -806,10 +806,13 @@ TOKEN = {"type": "string", "description": "lease token returned by hub_acquire/h
 KEY = {"type": "string", "description": "agent_key returned on the agent's first use; only required to resume the agent after its lease expired"}
 TOOLS = [
     ("hub_acquire", "Get a free Blender worker (boots a new one if needed) and lease it. By default it opens a Blender WINDOW so the user watches you work live (one window per session); pass gui=false for background/parallel batch work. Returns worker + token: keep the token, every other tool needs it. mode=exclusive (only you, default) or shared (several agents, each in its own collection). When done: hub_release, then ask the user whether to close the window (hub_stop_worker); windows never close on their own and are capped (BLENDER_HUB_MAX_WINDOWS).",
-     {"mode": {"type": "string", "enum": ["exclusive", "shared"]}, "label": S, "blend": S, "ttl": {"type": "number"},
-      "gui": {"type": "boolean", "description": "default true (server setting BLENDER_HUB_GUI_DEFAULT): windowed Blender the user can watch live; false = background"}}, []),
+     {"mode": {"type": "string", "enum": ["exclusive", "shared"]},
+      "label": {"type": "string", "description": "what this session is doing (e.g. 'castle walls v2'); shown live in the window and in hub_list_workers"},
+      "blend": S, "ttl": {"type": "number"},
+      "gui": {"type": "boolean", "description": "default true (server setting BLENDER_HUB_GUI_DEFAULT): windowed Blender the user can watch live; false = background"}}, ["label"]),
     ("hub_lease", "Join a specific worker (e.g. another agent's shared one). Returns a token. Default mode=exclusive; pass mode=\"shared\" to join a worker others are using.",
-     {"worker": S, "mode": {"type": "string", "enum": ["exclusive", "shared"]}, "label": S, "ttl": {"type": "number"}}, ["worker"]),
+     {"worker": S, "mode": {"type": "string", "enum": ["exclusive", "shared"]},
+      "label": {"type": "string", "description": "what this session is doing; shown live in the window"}, "ttl": {"type": "number"}}, ["worker", "label"]),
     ("hub_renew", "Renew the lease (every command already renews it).", {"worker": S, "token": TOKEN}, ["worker", "token"]),
     ("hub_release", "Release only your own lease.", {"worker": S, "token": TOKEN}, ["worker", "token"]),
     ("hub_list_workers", "List live workers: leases, agents, what each is busy with, RAM, autosave. Does not wait for long-running work.", {}, []),
@@ -828,7 +831,7 @@ TOOLS = [
     ("hub_list_archives", "Work archived when the pool recycled a worker (name, time, agents, folder).",
      {"name": S}, []),
     ("hub_restore_archive", "Boot a new worker with the archived work of a recycle (newest autosave + keys). "
-                            "Then: hub_lease(worker, mode=\"shared\") and pass your agent_key on your next hub_exec. "
+                            "Then: hub_lease(worker, mode=\"shared\", label=...) and pass your agent_key on your next hub_exec. "
                             "Keeps the archived worker's window mode unless gui is given.",
      {"archive": S, "name": S, "gui": {"type": "boolean"}}, ["archive"]),
     ("hub_kill_worker", "Hung worker: kill it and boot from autosave. Only if you hold the only live lease, or the running job is past its own timeout by more than the grace period (BLENDER_HUB_KILL_GRACE, default 60 s).",
@@ -934,7 +937,7 @@ def serve_mcp():
                 res = {"protocolVersion": asked if asked in SUPPORTED_PROTOCOLS else SUPPORTED_PROTOCOLS[0],
                        "capabilities": {"tools": {}},
                        "serverInfo": {"name": "blender-hub", "version": VERSION},
-                       "instructions": "Blender workers for multiple agents. Start with hub_acquire (opens a Blender window the user watches live by default; gui=false for background) and keep the token; "
+                       "instructions": "Blender workers for multiple agents. Start with hub_acquire(label=<what you are doing>) (opens a Blender window the user watches live by default, with a panel showing which agents are working; gui=false for background) and keep the token; "
                                        "always use the same `agent` name and keep the agent_key returned on its first use (resuming after the lease expires requires it). hub_turntable returns the turntable contact sheet; hub_measure solves fitting/contact. "
                                        "When your task is done: hub_release, and ask the user before closing the window (hub_stop_worker)."}
             elif method == "tools/list":

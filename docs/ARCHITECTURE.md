@@ -49,6 +49,10 @@ MCP client (Claude Desktop/Code, Cursor...) --stdio--> hub.py (MCP server, state
   - closing through the hub skips the "Save?" prompt, while the window's X keeps it;
   - the user's selection is restored after `hub_view`.
 
+## Live panel and modules
+- Window workers register a `POST_PIXEL` draw handler on every 3D view that prints `_overlay_lines()` (the same data the network thread returns in `status.overlay`): leases, the agents bound to them, the running command and each agent's last activity. The timer tick redraws the 3D views once a second so the clocks move.
+- `BLENDER_HUB_MODULES` files are executed into their own dicts and injected into each `hub_exec` namespace by name; they are re-executed when the file's mtime changes.
+
 ## Measure
 - Samples are vertices plus points along every edge (spacing `tol`, default 0.02, widened before allocating for huge meshes), from both sides, against the other object's BVH.
 - Penetration candidates are confirmed by 3-direction ray parity on a random sample; open meshes report `manifold: false`.

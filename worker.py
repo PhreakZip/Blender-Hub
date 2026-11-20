@@ -41,6 +41,7 @@ import threading
 import traceback
 import io
 import contextlib
+import linecache
 
 import bpy
 import bmesh
@@ -52,7 +53,7 @@ try:
 except Exception:
     np = None
 
-VERSION = "0.7.0"
+VERSION = "0.8.0"
 LEASE_TTL_DEFAULT = 900.0
 LEASE_TTL_MAX = 3600.0
 NET_CMDS = {"ping", "status", "check_token"}   # answered outside the queue, without bpy
@@ -95,6 +96,8 @@ STATUS = {"busy": None, "busy_since": None, "busy_token": None, "busy_deadline":
           "last_activity": time.time(), "last_autosave": None, "autosave_path": None,
           "started": time.time(), "objects": 0, "owners": {}, "gui": not bpy.app.background}
 JOBS = queue.Queue()
+AGENT_LAST = {}                # agent -> time of its last command (live overlay)
+MODULES = {}                   # name -> {"path", "mtime", "ns" (dict) or None, "error"}
 RUNNING = True
 MAIN_TID = threading.get_ident()
 
@@ -170,10 +173,17 @@ def _check_token(req):
             _renew(tok)
             return tok
         if tok in EXPIRED:
-            raise PermissionError("your lease expired: call hub_lease(worker, mode=<your original mode>) for a new token, "
+            raise PermissionError("your lease expired: call hub_lease(worker, mode=<your original mode>, label=<what you are doing>) for a new token, "
                                   "then pass your agent_key in the next hub_exec/hub_turntable/hub_export_collection "
                                   "(another session may have made changes)")
     raise PermissionError("command requires a valid lease token (hub_acquire/hub_lease)")
+
+
+def _autoname(token, agent):
+    """An unnamed lease is named after its first agent (called only after the bind succeeded)."""
+    part = PARTS.get(token)
+    if part and part.get("auto_label"):
+        part["label"], part["auto_label"] = agent, False
 
 
 def _bind_agent(req, token):
@@ -189,6 +199,7 @@ def _bind_agent(req, token):
         if agent in KEYS:
             if cur == token or _khash(req.get("agent_key")) == KEYS[agent]:
                 AGENTS[agent] = token
+                _autoname(token, agent)
                 return agent, None, None
             if exclusive:  # lost key: an exclusive lease reissues it, with a recorded notice
                 key = secrets.token_hex(8)
@@ -199,6 +210,7 @@ def _bind_agent(req, token):
                 _save_keys()
                 NOTICES.setdefault(agent, []).append({"owner": agent, "what": "agent_key reissued by an exclusive lease",
                                                       "at": time.strftime("%H:%M:%S")})
+                _autoname(token, agent)
                 return agent, key, "agent_key reissued (the old one is no longer valid)"
             last = (REISSUES.get(agent) or [None])[-1]
             if last:  # whoever comes back with the old key learns who reissued it and when
@@ -214,6 +226,7 @@ def _bind_agent(req, token):
         KEYS[agent] = _khash(key)
         AGENTS[agent] = token
         _save_keys()
+        _autoname(token, agent)
         return agent, key, None
 
 
@@ -671,6 +684,7 @@ def cmd_lease(req):
     if mode not in ("exclusive", "shared"):
         raise ValueError("mode = exclusive | shared")
     ttl = min(max(float(req.get("ttl", LEASE_TTL_DEFAULT)), 2.0), LEASE_TTL_MAX)
+    auto_label = not req.get("label")
     label = str(req.get("label") or "unnamed")[:60]
     with LOCK:
         live = list(PARTS.values())
@@ -679,7 +693,7 @@ def cmd_lease(req):
         if mode == "shared" and any(p["mode"] == "exclusive" for p in live):
             raise PermissionError("worker reserved in exclusive mode")
         tok = secrets.token_hex(12)
-        PARTS[tok] = {"label": label, "mode": mode, "ttl": ttl, "expires": _now() + ttl}
+        PARTS[tok] = {"label": label, "mode": mode, "ttl": ttl, "expires": _now() + ttl, "auto_label": auto_label}
     return {"token": tok, "mode": mode, "ttl": ttl, "worker": ARGS["name"]}
 
 
@@ -806,6 +820,81 @@ def cmd_claim(req):
     return {"collection": _agent_coll(req["_agent"]).name}
 
 
+def _module_specs():
+    """BLENDER_HUB_MODULES="K=C:\\path\\kit.py;other=C:\\x.py" (name defaults to the file stem)."""
+    out = []
+    for item in os.environ.get("BLENDER_HUB_MODULES", "").split(";"):
+        item = item.strip()
+        if not item:
+            continue
+        name, path = item.split("=", 1) if "=" in item and not re.match(r"^[A-Za-z]:[\\/]", item) else (None, item)
+        path = os.path.abspath(path.strip().strip('"'))
+        name = (name or os.path.splitext(os.path.basename(path))[0]).strip()
+        out.append((name, path))
+    return out
+
+
+MODULE_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+RESERVED_NAMES = {"bpy", "bmesh", "mathutils", "np", "math", "agent", "coll", "link", "result"}
+
+
+AGENT_MODS = {}  # (module name, agent) -> (mtime, globals dict): every agent gets its own instance
+
+
+def _load_modules(agent=None):
+    """Each module is exec'd into its own dict (same as `K = {}; exec(open(path).read(), K)`),
+    re-loaded when its file changes. A broken module never blocks hub_exec: its error is reported.
+
+    MODULES holds the checked, compiled code. With `agent`, that agent gets ITS OWN instance (exec'd once per
+    agent and file version), so `K` is the kit functions' own globals: `K["SCALE"] = 2; K["build"]()` works as in
+    the plain pattern, and nothing an agent sets in its K reaches the other agents."""
+    def put(name, value):
+        with LOCK:  # status() reads MODULES from the network thread
+            MODULES[name] = value
+    for name, path in _module_specs():
+        if not MODULE_NAME_RE.fullmatch(name):
+            put(name, {"path": path, "mtime": None, "ns": None, "error": "invalid name (use letters, digits and _)"})
+            continue
+        if name in RESERVED_NAMES:
+            put(name, {"path": path, "mtime": None, "ns": None, "error": f"reserved name: {sorted(RESERVED_NAMES)} are hub_exec built-ins"})
+            continue
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError as e:
+            put(name, {"path": path, "mtime": None, "ns": None, "error": f"{type(e).__name__}: {e}"})
+            continue
+        cur = MODULES.get(name)
+        if cur and cur["mtime"] == mtime and cur["path"] == path:
+            continue
+        ns = {"__file__": path, "__name__": f"hub_module_{name}"}
+        try:
+            with open(path, encoding="utf-8") as f:
+                src = f.read()
+            # "<exec module ...>" filename: the exec watchdog can interrupt a module that hangs at load
+            fname = f"<exec module {name}: {path}>"
+            code = compile(src, fname, "exec")
+            linecache.cache[fname] = (len(src), None, src.splitlines(True), fname)  # tracebacks show the kit's lines
+            _run_guarded(lambda: exec(code, ns), 60)  # probe: a broken module is reported once, not per agent
+            put(name, {"path": path, "mtime": mtime, "ns": ns, "code": code, "error": None})
+        except BaseException:
+            put(name, {"path": path, "mtime": mtime, "ns": None, "code": None, "error": traceback.format_exc(limit=3)[-600:]})
+    if not agent:
+        return
+    with LOCK:
+        ready = [(n, m) for n, m in MODULES.items() if m.get("code") is not None]
+    for name, m in ready:
+        key = (name, agent)
+        cur = AGENT_MODS.get(key)
+        if cur and cur[0] == m["mtime"]:
+            continue
+        ns = {"__file__": m["path"], "__name__": f"hub_module_{name}"}
+        try:
+            _run_guarded(lambda: exec(m["code"], ns), 60)
+            AGENT_MODS[key] = (m["mtime"], ns)
+        except BaseException:
+            AGENT_MODS.pop(key, None)
+
+
 def cmd_exec(req):
     agent = req["_agent"]
     coll = _agent_coll(agent)
@@ -829,7 +918,8 @@ def cmd_exec(req):
             coll.objects.link(ob)
         return ob
 
-    ns = {"bpy": bpy, "bmesh": bmesh, "mathutils": mathutils, "np": np, "math": math,
+    mods = {n: inst[1] for (n, a), inst in AGENT_MODS.items() if a == agent and n in MODULES and MODULES[n].get("code")}
+    ns = {**mods, "bpy": bpy, "bmesh": bmesh, "mathutils": mathutils, "np": np, "math": math,
           "agent": agent, "coll": coll, "link": link, "result": None}
     buf = io.StringIO()
     err = None
@@ -1133,6 +1223,8 @@ def dispatch(req):
         token = _check_token(req)
         if cmd in NEEDS_AGENT:
             req["_agent"], key, warn = _bind_agent(req, token)
+            STATUS["busy_agent"] = req["_agent"]
+            AGENT_LAST[req["_agent"]] = time.time()
             if key:
                 extra["agent_key"] = key
             if warn:
@@ -1143,6 +1235,8 @@ def dispatch(req):
         warn = _ensure_object_mode()
         if warn:
             extra["warning"] = (extra.get("warning", "") + " | " if extra.get("warning") else "") + warn
+    if cmd == "exec":  # (re)load modules BEFORE the ownership snapshot: their import is nobody's change
+        _load_modules(req.get("_agent"))
     before = _snapshot(req.get("_agent"), exclusive) if cmd in TOUCHES_SCENE else None
     # job deadline, exposed in status: a timeout kill only applies after it (+ margin)
     limit = {"exec": min(max(float(req.get("timeout", 120)), 1.0), 1800.0), "turntable": 1800.0}.get(cmd, 600.0)
@@ -1184,6 +1278,12 @@ def _autosave(force=False):
 
 
 # ---------------------------------------------------------------- network
+def _modules_view():
+    with LOCK:
+        items = list(MODULES.items())
+    return {n: ("ok" if m.get("ns") is not None else (m.get("error") or "not loaded")) for n, m in items}
+
+
 def _status():
     rss, peak = _rss_mb()
     _gc_leases()
@@ -1198,6 +1298,8 @@ def _status():
             "busy_s": round(time.time() - STATUS["busy_since"], 1) if STATUS["busy_since"] else None,
             "busy_overdue_s": round(time.time() - STATUS["busy_deadline"], 1) if STATUS["busy"] and STATUS["busy_deadline"] else None,
             "queue": JOBS.qsize(), "participants": parts, "agents": agents, "owners": owners, "key_reissues": reissues,
+            "modules": _modules_view(),
+            "overlay": _overlay_lines(),
             "commands": STATUS["commands"], "objects": STATUS["objects"], "autosave": STATUS["autosave_path"],
             "idle_s": round(time.time() - STATUS["last_activity"], 1), "uptime_s": round(time.time() - STATUS["started"], 1)}
 
@@ -1303,6 +1405,89 @@ def main():
 
 
 GUI_AUTOSAVE_S = 5.0  # window mode: the user may close it with the X at any time
+OVERLAY = os.environ.get("BLENDER_HUB_OVERLAY", "1").strip().lower() not in ("0", "false", "no", "off", "")
+
+
+def _ago(t):
+    s = max(0, int(time.time() - t))
+    return f"{s}s" if s < 60 else (f"{s // 60}m" if s < 3600 else f"{s // 3600}h{(s % 3600) // 60:02d}")
+
+
+def _overlay_lines():
+    """[(text, kind)] for the live panel: kind = title | busy | active | idle | dim. Works without bpy."""
+    _gc_leases()
+    now = time.time()
+    with LOCK:
+        parts = dict(PARTS)
+        agents = dict(AGENTS)
+        busy_tok, busy_cmd, busy_agent = STATUS.get("busy_token"), STATUS.get("busy"), STATUS.get("busy_agent")
+        busy_since = STATUS.get("busy_since")
+        last = dict(AGENT_LAST)
+    by_tok = {}
+    for a, t in agents.items():
+        by_tok.setdefault(t, []).append(a)
+    working = sorted(agents)
+    head = f"Blender Hub  {ARGS['name']}  |  {len(working)} agent{'s' if len(working) != 1 else ''} working"
+    if len(parts) != len(by_tok):
+        head += f", {len(parts)} lease{'s' if len(parts) != 1 else ''}"
+    lines = [(head, "title")]
+    for a in working:
+        t = agents[a]
+        p = parts.get(t, {})
+        lease = f"'{p.get('label', '?')}' {p.get('mode', '')}".strip()
+        if busy_tok == t and busy_cmd and (busy_agent in (None, a)):
+            state, kind = f"running {busy_cmd} {_ago(busy_since or now)}", "busy"
+        elif a in last and now - last[a] < 60:
+            state, kind = f"active, last command {_ago(last[a])} ago", "active"
+        else:
+            state, kind = (f"idle {_ago(last[a])}" if a in last else "idle"), "idle"
+        lines.append((f"{a}  ·  {state}  ·  lease {lease}", kind))
+    for t, p in parts.items():
+        if t not in by_tok:
+            lines.append((f"lease '{p['label']}' ({p['mode']}) with no agent yet", "dim"))
+    if not parts:
+        lines.append(("no lease: nobody is working here", "dim"))
+    return lines
+
+
+_OVERLAY_COLORS = {"title": (1.0, 0.82, 0.35, 1.0), "busy": (0.45, 1.0, 0.45, 1.0), "active": (0.9, 0.95, 1.0, 1.0),
+                   "idle": (0.62, 0.66, 0.72, 1.0), "dim": (0.55, 0.57, 0.6, 1.0)}
+
+
+def _draw_overlay():
+    try:
+        import blf
+        region = bpy.context.region
+        if region is None or region.type != "WINDOW":
+            return
+        ui = bpy.context.preferences.system.ui_scale
+        size = int(12 * ui)
+        font = 0
+        blf.size(font, size)
+        lines = _overlay_lines()
+        pad, step = int(14 * ui), int(17 * ui)
+        tools = next((r.width for r in bpy.context.area.regions if r.type == "TOOLS"), 0)
+        x = pad + tools
+        y = pad + step * (len(lines) - 1)
+        blf.enable(font, blf.SHADOW)
+        blf.shadow(font, 3, 0.0, 0.0, 0.0, 0.85)
+        blf.shadow_offset(font, 1, -1)
+        for text, kind in lines:
+            blf.color(font, *_OVERLAY_COLORS.get(kind, (1, 1, 1, 1)))
+            blf.position(font, x, y, 0)
+            blf.draw(font, text)
+            y -= step
+        blf.disable(font, blf.SHADOW)
+    except Exception:
+        pass
+
+
+def _redraw_views():
+    with contextlib.suppress(Exception):
+        for win in bpy.context.window_manager.windows:
+            for area in win.screen.areas:
+                if area.type == "VIEW_3D":
+                    area.tag_redraw()
 
 
 def _gui_start(sock):
@@ -1335,6 +1520,8 @@ def _gui_start(sock):
                     STATUS["dirty"] = True
                     return
         bpy.app.handlers.depsgraph_update_post.append(_user_edit)
+        if OVERLAY:  # live panel: worker, how many / which agents are working (bottom-left of every 3D view)
+            bpy.types.SpaceView3D.draw_handler_add(_draw_overlay, (), "WINDOW", "POST_PIXEL")
         bpy.app.timers.register(tick, first_interval=0.05, persistent=True)
         return None
 
@@ -1354,6 +1541,9 @@ def _gui_start(sock):
         if ARGS["autosave"] > 0 and STATUS["dirty"] and time.time() - (STATUS["last_autosave"] or 0) > gap:
             with contextlib.suppress(Exception):
                 _autosave()
+        if OVERLAY and time.time() - STATUS.get("overlay_drawn", 0) > 1.0:  # clocks in the panel tick once a second
+            STATUS["overlay_drawn"] = time.time()
+            _redraw_views()
         if not RUNNING:
             with contextlib.suppress(Exception):
                 sock.close()
@@ -1400,7 +1590,7 @@ def _loop_once(block=True):
     _disarm()
     with contextlib.suppress(Exception):
         _refresh_owners()
-    STATUS.update(busy=None, busy_since=None, busy_token=None, busy_deadline=None, commands=STATUS["commands"] + 1,
+    STATUS.update(busy=None, busy_since=None, busy_token=None, busy_deadline=None, busy_agent=None, commands=STATUS["commands"] + 1,
                   file=bpy.data.filepath or None, objects=len(bpy.data.objects), last_activity=time.time())
     with LOCK:
         tin = req.get("token")

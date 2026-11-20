@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.8.0 — 2026-11-19
+- Live panel in every window (bottom-left of the 3D viewport): worker name, how many agents are working, and per agent whether it is running a command, active or idle, with its lease. Same lines in `hub_list_workers` (`overlay`); `BLENDER_HUB_OVERLAY=0` hides it.
+- `label` is required on the MCP `hub_acquire` / `hub_lease`; a lease created without one is named after its first agent.
+- `BLENDER_HUB_MODULES`: Python files preloaded into every `hub_exec` (as `NAME`), reloaded when changed; errors reported in `hub_list_workers` (`modules`). Installer: `--module NAME=PATH` / `-Module`.
+
 ## 0.7.0 — 2026-11-19
 - Live by default: `hub_acquire` / `hub_start_worker` open a Blender window unless `gui=false` (one window per session). `BLENDER_HUB_GUI_DEFAULT=0` restores background as the default. The Python API keeps background as its default.
 - MCP instructions and the `hub_acquire` description tell agents to release and ask the user before closing the window when done.

@@ -14,6 +14,8 @@ Options:
     --blender PATH   Blender executable (default: auto-detect, see blender_paths.py)
     --config PATH    Claude Desktop config file (default: auto-detect; required if several exist)
     --name NAME      MCP server name (default: blender-hub)
+    --module N=PATH  load a Python file into every hub_exec as `N`; repeat the flag for several
+                     (install.ps1: -Module "K=a.py","L=b.py"), e.g. --module K=C:\kits\kit.py
     --background     agents work in background Blenders by default (no windows); use on machines
                      without a desktop/OpenGL (VMs, RDP, remote). Default: one live window per session
     --yes            do not ask before writing a config file
@@ -84,8 +86,10 @@ def check_blender(path):
 
 
 # ---------------------------------------------------------------- entry
-def server_entry(blender, background=False):
+def server_entry(blender, background=False, modules=None):
     env = {"BLENDER_EXE": blender}
+    if modules:
+        env["BLENDER_HUB_MODULES"] = ";".join(modules)
     if background:
         env["BLENDER_HUB_GUI_DEFAULT"] = "0"
     return {"command": sys.executable, "args": [HUB], "env": env}
@@ -265,6 +269,7 @@ def main():
     ap.add_argument("--uninstall", action="store_true")
     ap.add_argument("--yes", action="store_true")
     ap.add_argument("--background", action="store_true")
+    ap.add_argument("--module", action="append", default=[])
     args = ap.parse_args()
 
     check_platform()
@@ -273,7 +278,18 @@ def main():
         blender = None
     else:
         blender = check_blender(args.blender)
-        entry = server_entry(blender, args.background)
+        mods = []
+        for m in args.module:
+            name, _, path = m.partition("=")
+            if not path or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+                fail(f"--module must be NAME=PATH (NAME: ASCII letters, digits, _): {m!r}")
+            if name in ("bpy", "bmesh", "mathutils", "np", "math", "agent", "coll", "link", "result"):
+                fail(f"--module name {name!r} is reserved (hub_exec built-in)")
+            path = os.path.abspath(path)
+            if not os.path.isfile(path):
+                fail(f"--module file not found: {path}")
+            mods.append(f"{name}={path}")
+        entry = server_entry(blender, args.background, mods)
     if args.check:
         say("check only: nothing was changed", "ok")
         return
